@@ -1,5 +1,8 @@
 import os
 import re
+import hmac
+import base64
+import hashlib
 import sqlite3
 import numpy as np
 from flask import Flask, request, jsonify
@@ -21,19 +24,19 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 # Models
-EMBED_MODEL = "text-embedding-3-small"   
+EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL  = "gpt-4o-mini"
 
 DB_PATH = "kb.db"
 
 TOP_N = 8
-SIM_THRESHOLD = 0.10   
+SIM_THRESHOLD = 0.10
 KW_THRESHOLD  = 0.08
 
-COS_MIN       = 0.20     # minimum cosine to be considered "plausible"
-KW_MIN        = 0.12     # minimum keyword overlap to help a low-ish cosine
-SELECTED_MIN  = 0.24     # if selected-category top score below this, allow switching
-RESCUE_DELTA  = 0.06     # switch if global best beats selected by this margin
+COS_MIN       = 0.20
+KW_MIN        = 0.12
+SELECTED_MIN  = 0.24
+RESCUE_DELTA  = 0.06
 
 # Debug
 DEBUG_CANDIDATES = os.getenv("DEBUG_CANDIDATES", "false").lower() == "true"
@@ -67,6 +70,9 @@ SMART_DISCLAIMER = os.getenv(
     "SMART_DISCLAIMER",
     "Disclaimer: Sesetengah informasi kemungkinan tidak tepat, sila hubungi kumpulan kami untuk maklumat lanjut. Sila tekan butang 4."
 )
+
+# Shopify HMAC (optional — verify jika DISABLE_HMAC != 1)
+SHOPIFY_SHARED_SECRET = os.getenv("SHOPIFY_SHARED_SECRET", "")
 
 app = Flask(__name__)
 CORS(app)
@@ -102,11 +108,9 @@ def _connect():
     conn.row_factory = sqlite3.Row
     return conn
 
-# --- Category normalization (handles 'Sedang Hamil  ' vs 'sedang_hamil') ---
 def _norm_cat_key(s: str) -> str:
     return (s or "").strip().lower().replace(" ", "_")
 
-# --- Lightweight BM/EN synonym expansion (helps short/slang queries) ---
 BM_SYNONYMS = {
     "macam mana": ["bagaimana", "mcm mana", "camna", "cara"],
     "consume": ["minum", "ambil", "pengambilan", "guna", "consume"],
@@ -125,7 +129,6 @@ def _load_qa_rows(category: str):
     conn = _connect()
     c = conn.cursor()
     try:
-        # TRIM + normalize to avoid whitespace/label mismatches
         c.execute("""
             SELECT id, question, answer, q_embedding
             FROM knowledge_base_qa
@@ -175,7 +178,6 @@ def _clean_prefixes(s: str) -> str:
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").lower()).strip()
 
-# intent & shape detectors
 def _looks_like_why(q: str) -> bool:
     ql = (q or "").lower()
     return any(w in ql for w in ["kenapa", "mengapa", "sebab", "why", "justifikasi", "justify"])
@@ -404,8 +406,7 @@ def ask():
         category = data.get("category")
         question  = (data.get("question") or "").strip()
 
-        # convo memory (optional from frontend)
-        history       = data.get("history") or []   # [{role, content}]
+        history       = data.get("history") or []
         prev_question = (data.get("prev_question") or "").strip()
         prev_answer   = (data.get("prev_answer") or "").strip()
         prev_category = (data.get("prev_category") or "").strip()
@@ -433,7 +434,6 @@ def ask():
         intent_why = _looks_like_why(question)
         intent_how = _looks_like_how(question)
 
-        # contextual WHY: use previous turn if vague
         if intent_why:
             ctx_q, ctx_a, ctx_cat = None, None, None
             if prev_answer:
@@ -448,7 +448,6 @@ def ask():
                     suggestions = related_kb_questions(question, ctx_cat, n=3)
                     return jsonify({"answer": linkify_platforms(extra), "suggestions": suggestions, "used_context": True})
 
-        # 1) KB retrieval in the selected category
         cands = retrieve_candidates(question, cat_key, top_n=TOP_N)
         best = cands[0] if cands else None
         selected_score = best["score"] if best else 0.0
@@ -461,11 +460,9 @@ def ask():
 
         selected_ok = _score_ok(best)
 
-        # Always compute a global best for comparison
         global_best, global_cat = retrieve_candidates_any(question, top_n=TOP_N)
         global_score = global_best["score"] if global_best else 0.0
 
-        # Decide whether to keep selected category or switch
         use_kb = False
         if best and selected_ok and (selected_score >= SELECTED_MIN) and (selected_score >= global_score - RESCUE_DELTA):
             use_kb = True
@@ -479,7 +476,7 @@ def ask():
 
         if use_kb:
             need_selector = False
-            if len(cands) >= 2 and cat_key == mapping.get(str(category)):  # only compare within same cat list we fetched
+            if len(cands) >= 2 and cat_key == mapping.get(str(category)):
                 margin = cands[0]["score"] - cands[1]["score"]
                 need_selector = margin < 0.08
 
@@ -490,7 +487,6 @@ def ask():
 
                     extra = _justify_answer(question, answer, cat_key)
                     if not extra:
-
                         any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
                         if any_cat:
                             kws = list(set(_tokens(question)))
@@ -534,7 +530,6 @@ def ask():
                 suggestions = related_kb_questions(question, cat_key, exclude_q=best["q"], n=3)
                 return jsonify({"answer": answer, "suggestions": suggestions, "used_context": False})
 
-            # tie-breaker using model to pick ONE KB answer
             context_block = "\n\n".join([f"Question: {c['q']}\nAnswer: {c['a']}" for c in cands[:TOP_N]])
             system_prompt = (
                 "You are EffertyAskMe. Choose exactly ONE QA pair from the KB that best answers the user.\n"
@@ -566,7 +561,6 @@ def ask():
             fallback = "Harap maaf. Sila berhubung dengan agent kami untuk mengetahui lebih lanjut dengan menekan butang 4."
             return jsonify({"answer": linkify_platforms(fallback), "suggestions": related_kb_questions(question, cat_key, n=3), "used_context": False})
 
-        # Smart GPT fallback
         print("Smart GPT")
         kb_best, kb_cat = retrieve_candidates_any(question, TOP_N)
         kb_context = ""
@@ -604,7 +598,7 @@ def ask():
             c = conn.cursor()
             c.execute(
                 "INSERT INTO generated_answers (category, user_question, ai_answer) VALUES (?, ?, ?)",
-                (cat_key, question, answer)
+                (kb_cat or "lain_lain", question, answer)
             )
             conn.commit()
             conn.close()
@@ -612,7 +606,7 @@ def ask():
             pass
 
         suggestions = related_kb_questions(
-            question, cat_key, exclude_q=best["q"] if best else None, n=3
+            question, kb_cat or "lain_lain", exclude_q=best["q"] if best else None, n=3
         )
         return jsonify({
             "answer": linkify_platforms(answer),
@@ -623,6 +617,46 @@ def ask():
     except Exception as e:
         print("Server error:", e)
         return jsonify({"error": "Internal Server Error"}), 500
+
+# =========================
+# Shopify App Proxy endpoint
+# =========================
+@app.route("/proxy", methods=["GET", "POST"])
+def proxy():
+    """
+    Lightweight proxy for Shopify App Proxy:
+    - Optional HMAC verification (enable if SHOPIFY_SHARED_SECRET set and DISABLE_HMAC != 1)
+    - Accepts ?message=... and optional category (default: lain_lain)
+    - Forwards to /ask and returns JSON answer
+    """
+    # --- optional HMAC verify ---
+    if SHOPIFY_SHARED_SECRET and os.getenv("DISABLE_HMAC", "0") != "1":
+        incoming_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
+        raw = request.get_data() if request.method == "POST" else request.query_string
+        digest = base64.b64encode(hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
+        if not hmac.compare_digest(digest, incoming_hmac):
+            return jsonify({"error": "invalid hmac"}), 401
+
+    # --- pull input ---
+    msg = (
+        request.values.get("message")
+        or (request.get_json(silent=True) or {}).get("message")
+        or ""
+    ).strip()
+    cat = (request.values.get("category") or "lain_lain").strip()
+
+    if not msg:
+        return jsonify({"error": "missing message"}), 400
+
+    # forward to /ask using internal request context
+    payload = {"category": cat, "question": msg}
+    with app.test_request_context(json=payload):
+        return ask()
+
+# Simple healthcheck
+@app.get("/")
+def health():
+    return jsonify({"ok": True, "service": "efferty-chatbot-backend", "version": 1})
 
 # =========================
 # Admin API
