@@ -1,4 +1,5 @@
 flask==3.0.0
 gunicorn==21.2.0
-python-dotenv==1.0.1   # kalau kau load .env
-requests==2.32.3       # biasa dipakai
+numpy==1.26.4
+python-dotenv==1.0.1
+requests==2.32.3
