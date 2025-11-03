@@ -635,6 +635,7 @@ def ask():
 # Shopify App Proxy endpoint (+ alias)
 # =========================
 @app.route("/proxy", methods=["GET", "POST"])
+@app.route("/proxy/", methods=["GET","POST"])
 def proxy():
     """
     Shopify App Proxy:
@@ -822,3 +823,4 @@ def admin_delete_qa(item_id):
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
+
