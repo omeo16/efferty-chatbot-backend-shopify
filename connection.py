@@ -15,7 +15,6 @@ from deep_translator import GoogleTranslator
 # =========================
 # Config
 # =========================
-openai.timeout = 25
 load_dotenv(find_dotenv(), override=True)
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -854,4 +853,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # host=0.0.0.0 penting untuk Render
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
