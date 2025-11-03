@@ -21,7 +21,7 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
     raise Exception("Set OPENAI_API_KEY in .env")
 
-client = OpenAI(api_key=OPENAI_KEY)
+client = OpenAI(api_key=OPENAI_KEY, timeout=25.0)
 
 # Models
 EMBED_MODEL = "text-embedding-3-small"
@@ -853,5 +853,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # host=0.0.0.0 penting untuk Render
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
 
