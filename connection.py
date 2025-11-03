@@ -178,6 +178,41 @@ def _normalize_cat_for_ask(cat_in: str) -> str:
         return "Sedang Hamil"
     return "Lain-Lain"
 
+# -------- NEW: tolerant extractor for message + category --------
+def _get_msg_and_cat(req):
+    """
+    Accept JSON / form / querystring. Allow multiple key aliases so the widget
+    doesn't have to send exactly 'message'.
+    """
+    data = req.get_json(silent=True) or {}
+    keys_msg = ["message", "msg", "text", "query", "q", "prompt", "content", "question"]
+    keys_cat = ["category", "cat", "kategori", "group", "topic", "kategory"]
+
+    def pick(d, keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    # JSON
+    msg = pick(data, keys_msg)
+    cat = pick(data, keys_cat)
+
+    # Form (Shopify often forwards as x-www-form-urlencoded)
+    if not msg:
+        msg = pick(request.values, keys_msg)
+    if not cat:
+        cat = pick(request.values, keys_cat)
+
+    # Querystring (GET)
+    if not msg:
+        msg = pick(request.args, keys_msg)
+    if not cat:
+        cat = pick(request.args, keys_cat)
+
+    return msg, cat
+
 # =========================
 # Retrieval & re-ranking
 # =========================
@@ -628,7 +663,6 @@ def ask():
 # =========================
 # Shopify App Proxy endpoint (+ alias)
 # =========================
-# Accept /proxy, /proxy/, and /proxy/<anything> to be resilient against double-appends
 @app.route("/proxy", methods=["GET", "POST"])
 @app.route("/proxy/", methods=["GET","POST"])
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
@@ -647,19 +681,13 @@ def proxy(_extra=None):
         if not hmac.compare_digest(digest, incoming_hmac):
             return jsonify({"error": "invalid hmac"}), 401
 
-    # --- pull input ---
-    if request.method == "GET":
-        msg = (request.args.get("message") or "").strip()
-        cat_raw = (request.args.get("category") or "").strip()
-    else:
-        body = request.get_json(silent=True) or {}
-        msg = (body.get("message") or request.values.get("message") or "").strip()
-        cat_raw = (body.get("category") or request.values.get("category") or "").strip()
+    # --- tolerant extractor (JSON/form/query) ---
+    msg, cat_raw = _get_msg_and_cat(request)
 
+    # GET tanpa message → bagi ok untuk test manual
+    if request.method == "GET" and not msg:
+        return jsonify({"ok": True, "via": "shopify-proxy", "hint": "POST {message:'hello',category:'2'}"}), 200
     if not msg:
-        # For GET manual test without message, return simple ok instead of 404
-        if request.method == "GET":
-            return jsonify({"ok": True, "via": "shopify-proxy", "hint": "send ?message=hello"}), 200
         return jsonify({"error": "missing message"}), 400
 
     cat_for_ask = _normalize_cat_for_ask(cat_raw)
@@ -669,7 +697,7 @@ def proxy(_extra=None):
     with app.test_request_context("/ask", method="POST", json=payload):
         return ask()
 
-# Alias to test /apps/chatbot locally
+# Alias supaya boleh test /apps/chatbot juga
 @app.route("/apps/chatbot", methods=["GET", "POST"])
 @app.route("/apps/chatbot/<path:_rest>", methods=["GET", "POST"])
 def proxy_alias(_rest=None):
