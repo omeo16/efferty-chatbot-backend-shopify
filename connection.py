@@ -21,10 +21,11 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
     raise Exception("Set OPENAI_API_KEY in .env")
 
+# default timeout untuk semua request OpenAI
 client = OpenAI(api_key=OPENAI_KEY, timeout=25.0)
 
 # Models
-EMBED_MODEL = "text-embedding-3-small"
+EMBED_MODEL = "text-embedding-3-small"   # 1536 dim
 CHAT_MODEL  = "gpt-4o-mini"
 
 DB_PATH = "kb.db"
@@ -126,9 +127,16 @@ def _expand_query(q: str) -> str:
             extra.extend(alts)
     return q if not extra else f"{q} " + " ".join(sorted(set(extra)))
 
+# ---------- hardened embed ----------
 def _embed(text: str) -> np.ndarray:
-    resp = client.embeddings.create(model=EMBED_MODEL, input=text)
-    return np.asarray(resp.data[0].embedding, dtype=np.float32)
+    """Return embedding or zero-vector (length 1536) on failure."""
+    try:
+        resp = client.embeddings.create(model=EMBED_MODEL, input=text)
+        return np.asarray(resp.data[0].embedding, dtype=np.float32)
+    except Exception as e:
+        print("EMBED error:", e)
+        # 1536 for text-embedding-3-small
+        return np.zeros(1536, dtype=np.float32)
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -178,12 +186,8 @@ def _normalize_cat_for_ask(cat_in: str) -> str:
         return "Sedang Hamil"
     return "Lain-Lain"
 
-# -------- NEW: tolerant extractor for message + category --------
+# -------- tolerant extractor for message + category --------
 def _get_msg_and_cat(req):
-    """
-    Accept JSON / form / querystring. Allow multiple key aliases so the widget
-    doesn't have to send exactly 'message'.
-    """
     data = req.get_json(silent=True) or {}
     keys_msg = ["message", "msg", "text", "query", "q", "prompt", "content", "question"]
     keys_cat = ["category", "cat", "kategori", "group", "topic", "kategory"]
@@ -195,17 +199,14 @@ def _get_msg_and_cat(req):
                 return str(v).strip()
         return ""
 
-    # JSON
     msg = pick(data, keys_msg)
     cat = pick(data, keys_cat)
 
-    # Form (Shopify often forwards as x-www-form-urlencoded)
     if not msg:
         msg = pick(request.values, keys_msg)
     if not cat:
         cat = pick(request.values, keys_cat)
 
-    # Querystring (GET)
     if not msg:
         msg = pick(request.args, keys_msg)
     if not cat:
@@ -246,6 +247,8 @@ def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
     if not rows:
         return []
     qvec = _embed(_expand_query(question))
+    if not qvec.any():
+        return []
     scored = []
     for r in rows:
         cos = _cosine(qvec, r["emb"])
@@ -295,6 +298,8 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
     if not rows:
         return []
     qvec = _embed(_expand_query(question))
+    if not qvec.any():
+        return []
     scored = []
     for row in rows:
         q_text = row["question"]
@@ -449,6 +454,15 @@ def ask():
         category = data.get("category")
         question  = (data.get("question") or "").strip()
 
+        # ---------- STRICT short-circuit (no OpenAI/DB) ----------
+        if STRICT_MODE:
+            fallback = "Harap maaf. Sila berhubung dengan agent kami untuk mengetahui lebih lanjut dengan menekan butang 4."
+            return jsonify({
+                "answer": linkify_platforms(fallback),
+                "suggestions": [],
+                "used_context": False
+            }), 200
+
         history       = data.get("history") or []
         prev_question = (data.get("prev_question") or "").strip()
         prev_answer   = (data.get("prev_answer") or "").strip()
@@ -599,10 +613,7 @@ def ask():
                 suggestions = related_kb_questions(question, cat_key, n=3)
                 return jsonify({"answer": answer, "suggestions": suggestions, "used_context": False})
 
-        if STRICT_MODE:
-            fallback = "Harap maaf. Sila berhubung dengan agent kami untuk mengetahui lebih lanjut dengan menekan butang 4."
-            return jsonify({"answer": linkify_platforms(fallback), "suggestions": related_kb_questions(question, cat_key, n=3), "used_context": False})
-
+        # fallback Smart GPT (tak kena bila STRICT_MODE true sbb dah return awal)
         print("Smart GPT")
         kb_best, kb_cat = retrieve_candidates_any(question, TOP_N)
         kb_context = ""
@@ -667,12 +678,6 @@ def ask():
 @app.route("/proxy/", methods=["GET","POST"])
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
 def proxy(_extra=None):
-    """
-    Shopify App Proxy:
-    - Storefront hit: /apps/chatbot/...  → Shopify → backend /proxy + ...
-    - Accepts GET (manual test) and POST (widget)
-    - Forwards to /ask and returns JSON answer
-    """
     # --- optional HMAC verify ---
     if SHOPIFY_SHARED_SECRET and os.getenv("DISABLE_HMAC", "0") != "1":
         incoming_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
@@ -681,10 +686,8 @@ def proxy(_extra=None):
         if not hmac.compare_digest(digest, incoming_hmac):
             return jsonify({"error": "invalid hmac"}), 401
 
-    # --- tolerant extractor (JSON/form/query) ---
     msg, cat_raw = _get_msg_and_cat(request)
 
-    # GET tanpa message → bagi ok untuk test manual
     if request.method == "GET" and not msg:
         return jsonify({"ok": True, "via": "shopify-proxy", "hint": "POST {message:'hello',category:'2'}"}), 200
     if not msg:
@@ -692,12 +695,10 @@ def proxy(_extra=None):
 
     cat_for_ask = _normalize_cat_for_ask(cat_raw)
 
-    # forward to /ask using internal request context
     payload = {"category": cat_for_ask, "question": msg}
     with app.test_request_context("/ask", method="POST", json=payload):
         return ask()
 
-# Alias supaya boleh test /apps/chatbot juga
 @app.route("/apps/chatbot", methods=["GET", "POST"])
 @app.route("/apps/chatbot/<path:_rest>", methods=["GET", "POST"])
 def proxy_alias(_rest=None):
@@ -853,6 +854,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # host=0.0.0.0 penting untuk Render
     app.run(host="0.0.0.0", port=port, debug=True)
-
-
-
