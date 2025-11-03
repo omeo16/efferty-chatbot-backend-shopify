@@ -78,7 +78,7 @@ app = Flask(__name__)
 CORS(app)
 
 # =========================
-# Small utils
+# Helpers
 # =========================
 def _escape_regex(s: str) -> str:
     return re.escape(s)
@@ -117,6 +117,7 @@ BM_SYNONYMS = {
     "susu": ["susu efferty", "efferty"],
     "kenapa": ["mengapa", "sebab", "justifikasi"],
 }
+
 def _expand_query(q: str) -> str:
     ql = (q or "").lower()
     extra = []
@@ -124,31 +125,6 @@ def _expand_query(q: str) -> str:
         if key in ql:
             extra.extend(alts)
     return q if not extra else f"{q} " + " ".join(sorted(set(extra)))
-
-def _load_qa_rows(category: str):
-    conn = _connect()
-    c = conn.cursor()
-    try:
-        c.execute("""
-            SELECT id, question, answer, q_embedding
-            FROM knowledge_base_qa
-            WHERE lower(replace(trim(category), ' ', '_')) = ?
-        """, (_norm_cat_key(category),))
-        rows = c.fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    finally:
-        conn.close()
-    if DEBUG_CANDIDATES:
-        print(f"[DEBUG] loaded rows for {category} =", len(rows))
-    items = []
-    for row in rows:
-        emb_blob = row["q_embedding"]
-        if emb_blob is None:
-            continue
-        emb = np.frombuffer(emb_blob, dtype=np.float32)
-        items.append({"id": row["id"], "q": row["question"], "a": row["answer"], "emb": emb})
-    return items
 
 def _embed(text: str) -> np.ndarray:
     resp = client.embeddings.create(model=EMBED_MODEL, input=text)
@@ -194,9 +170,46 @@ def _looks_like_catalog(answer: str) -> bool:
     keywords = any(k in a for k in ["kategori", "perisa", "pilihan", "signature", "essential", "premium"])
     return has_list_markers or starts_with_terdapat or (many_commas and keywords)
 
+def _normalize_cat_for_ask(cat_in: str) -> str:
+    """
+    Map input → label yang ask() faham:
+    'Ikhtiar Hamil', 'Sedang Hamil', 'Lain-Lain'
+    """
+    c = (cat_in or "").strip().lower().replace("-", "_")
+    if c in {"1", "ikhtiar_hamil", "ikhtiar hamil", "ikhtiar", "subur"}:
+        return "Ikhtiar Hamil"
+    if c in {"2", "sedang_hamil", "sedang hamil", "hamil", "pregnant"}:
+        return "Sedang Hamil"
+    return "Lain-Lain"
+
 # =========================
 # Retrieval & re-ranking
 # =========================
+def _load_qa_rows(category: str):
+    conn = _connect()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT id, question, answer, q_embedding
+            FROM knowledge_base_qa
+            WHERE lower(replace(trim(category), ' ', '_')) = ?
+        """, (_norm_cat_key(category),))
+        rows = c.fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    if DEBUG_CANDIDATES:
+        print(f"[DEBUG] loaded rows for {category} =", len(rows))
+    items = []
+    for row in rows:
+        emb_blob = row["q_embedding"]
+        if emb_blob is None:
+            continue
+        emb = np.frombuffer(emb_blob, dtype=np.float32)
+        items.append({"id": row["id"], "q": row["question"], "a": row["answer"], "emb": emb})
+    return items
+
 def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
     rows = _load_qa_rows(category)
     if not rows:
@@ -619,14 +632,14 @@ def ask():
         return jsonify({"error": "Internal Server Error"}), 500
 
 # =========================
-# Shopify App Proxy endpoint
+# Shopify App Proxy endpoint (+ alias)
 # =========================
 @app.route("/proxy", methods=["GET", "POST"])
 def proxy():
     """
-    Lightweight proxy for Shopify App Proxy:
-    - Optional HMAC verification (enable if SHOPIFY_SHARED_SECRET set and DISABLE_HMAC != 1)
-    - Accepts ?message=... and optional category (default: lain_lain)
+    Shopify App Proxy:
+    - Storefront hit: /apps/chatbot → (Shopify) → backend /proxy
+    - Accepts ?message=... and optional category
     - Forwards to /ask and returns JSON answer
     """
     # --- optional HMAC verify ---
@@ -638,20 +651,28 @@ def proxy():
             return jsonify({"error": "invalid hmac"}), 401
 
     # --- pull input ---
-    msg = (
-        request.values.get("message")
-        or (request.get_json(silent=True) or {}).get("message")
-        or ""
-    ).strip()
-    cat = (request.values.get("category") or "lain_lain").strip()
+    if request.method == "GET":
+        msg = (request.args.get("message") or "").strip()
+        cat_raw = (request.args.get("category") or "").strip()
+    else:
+        body = request.get_json(silent=True) or {}
+        msg = (body.get("message") or request.values.get("message") or "").strip()
+        cat_raw = (body.get("category") or request.values.get("category") or "").strip()
 
     if not msg:
         return jsonify({"error": "missing message"}), 400
 
+    cat_for_ask = _normalize_cat_for_ask(cat_raw)
+
     # forward to /ask using internal request context
-    payload = {"category": cat, "question": msg}
-    with app.test_request_context(json=payload):
+    payload = {"category": cat_for_ask, "question": msg}
+    with app.test_request_context("/ask", method="POST", json=payload):
         return ask()
+
+# Alias supaya boleh test local /apps/chatbot juga
+@app.route("/apps/chatbot", methods=["GET", "POST"])
+def proxy_alias():
+    return proxy()
 
 # Simple healthcheck
 @app.get("/")
