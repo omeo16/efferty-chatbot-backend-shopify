@@ -41,7 +41,7 @@ RESCUE_DELTA  = 0.06
 # Debug
 DEBUG_CANDIDATES = os.getenv("DEBUG_CANDIDATES", "false").lower() == "true"
 
-# Strict mode (if true, never use GPT reasoning fallback)
+# Strict mode
 STRICT_MODE = os.getenv("STRICT_MODE", "false").lower() == "true"
 print(">>> DEBUG: STRICT_MODE from .env =", os.getenv("STRICT_MODE"))
 print(">>> DEBUG: parsed STRICT_MODE =", STRICT_MODE)
@@ -95,7 +95,7 @@ def linkify_platforms(text: str) -> str:
     html = text
     for labels, url in patterns:
         labels_sorted = sorted(labels, key=len, reverse=True)
-        alt = "|".join(_escape_regex(x) for x in labels_sorted)
+        alt = "|".join(re.escape(x) for x in labels_sorted)
         regex = re.compile(rf"(?<![\w/])({alt})(?![^<]*>)", re.IGNORECASE)
         def _repl(m):
             label = m.group(1)
@@ -171,10 +171,6 @@ def _looks_like_catalog(answer: str) -> bool:
     return has_list_markers or starts_with_terdapat or (many_commas and keywords)
 
 def _normalize_cat_for_ask(cat_in: str) -> str:
-    """
-    Map input → label yang ask() faham:
-    'Ikhtiar Hamil', 'Sedang Hamil', 'Lain-Lain'
-    """
     c = (cat_in or "").strip().lower().replace("-", "_")
     if c in {"1", "ikhtiar_hamil", "ikhtiar hamil", "ikhtiar", "subur"}:
         return "Ikhtiar Hamil"
@@ -228,7 +224,6 @@ def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
         r["kw"] = kw
         r["score"] = cos_w * r["cos"] + kw_w * r["kw"]
     cand.sort(key=lambda x: x["score"], reverse=True)
-
     if DEBUG_CANDIDATES:
         print("[DEBUG] top candidates:")
         for r in cand[:5]:
@@ -497,7 +492,6 @@ def ask():
                 answer = best["a"].strip()
                 weak_match = (best.get("kw", 0.0) < 0.12 and best.get("cos", 0.0) < 0.22)
                 if (intent_why or intent_how) and (_looks_like_catalog(answer) or weak_match):
-
                     extra = _justify_answer(question, answer, cat_key)
                     if not extra:
                         any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
@@ -590,7 +584,7 @@ def ask():
             msgs.append({"role": "system", "content": f"KB Context (use only if relevant):\n{kb_context}"})
         for m in history[-6:]:
             if m.get("role") in ("user", "assistant") and m.get("content"):
-                msgs.append({"role": m["role"], "content": m["content"]})
+                msgs.append({"role": m.get("role"), "content": m.get("content")})
         msgs.append({"role": "user", "content": question})
 
         chat = client.chat.completions.create(
@@ -634,13 +628,15 @@ def ask():
 # =========================
 # Shopify App Proxy endpoint (+ alias)
 # =========================
+# Accept /proxy, /proxy/, and /proxy/<anything> to be resilient against double-appends
 @app.route("/proxy", methods=["GET", "POST"])
 @app.route("/proxy/", methods=["GET","POST"])
-def proxy():
+@app.route("/proxy/<path:_extra>", methods=["GET","POST"])
+def proxy(_extra=None):
     """
     Shopify App Proxy:
-    - Storefront hit: /apps/chatbot → (Shopify) → backend /proxy
-    - Accepts ?message=... and optional category
+    - Storefront hit: /apps/chatbot/...  → Shopify → backend /proxy + ...
+    - Accepts GET (manual test) and POST (widget)
     - Forwards to /ask and returns JSON answer
     """
     # --- optional HMAC verify ---
@@ -661,6 +657,9 @@ def proxy():
         cat_raw = (body.get("category") or request.values.get("category") or "").strip()
 
     if not msg:
+        # For GET manual test without message, return simple ok instead of 404
+        if request.method == "GET":
+            return jsonify({"ok": True, "via": "shopify-proxy", "hint": "send ?message=hello"}), 200
         return jsonify({"error": "missing message"}), 400
 
     cat_for_ask = _normalize_cat_for_ask(cat_raw)
@@ -670,10 +669,11 @@ def proxy():
     with app.test_request_context("/ask", method="POST", json=payload):
         return ask()
 
-# Alias supaya boleh test local /apps/chatbot juga
+# Alias to test /apps/chatbot locally
 @app.route("/apps/chatbot", methods=["GET", "POST"])
-def proxy_alias():
-    return proxy()
+@app.route("/apps/chatbot/<path:_rest>", methods=["GET", "POST"])
+def proxy_alias(_rest=None):
+    return proxy(_rest)
 
 # Simple healthcheck
 @app.get("/")
@@ -822,5 +822,6 @@ def admin_delete_qa(item_id):
         return jsonify({"error": "Internal Server Error"}), 500
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
-
+    port = int(os.environ.get("PORT", 5000))
+    # host=0.0.0.0 penting untuk Render
+    app.run(host="0.0.0.0", port=port, debug=True)
