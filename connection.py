@@ -28,7 +28,12 @@ client = OpenAI(api_key=OPENAI_KEY, timeout=25.0)
 EMBED_MODEL = "text-embedding-3-small"   # 1536 dim
 CHAT_MODEL  = "gpt-4o-mini"
 
-DB_PATH = "kb.db"
+# ---- DB path robust ----
+DB_PATH = os.getenv(
+    "DB_PATH",
+    os.path.join(os.path.dirname(__file__), "kb.db")
+)
+print(">>> DEBUG: DB_PATH =", DB_PATH, "exists?", os.path.exists(DB_PATH))
 
 TOP_N = 8
 SIM_THRESHOLD = 0.10
@@ -39,18 +44,18 @@ KW_MIN        = 0.12
 SELECTED_MIN  = 0.24
 RESCUE_DELTA  = 0.06
 
-# Debug
-DEBUG_CANDIDATES = os.getenv("DEBUG_CANDIDATES", "false").lower() == "true"
+def _truthy(name, default="false"):
+    return (os.getenv(name, default) or "").strip().lower() in ("1","true","yes","y")
 
-# Strict mode
-STRICT_MODE = os.getenv("STRICT_MODE", "false").lower() == "true"
-print(">>> DEBUG: STRICT_MODE from .env =", os.getenv("STRICT_MODE"))
-print(">>> DEBUG: parsed STRICT_MODE =", STRICT_MODE)
+DEBUG_CANDIDATES = _truthy("DEBUG_CANDIDATES", "false")
+STRICT_MODE      = _truthy("STRICT_MODE", "false")
+DISABLE_HMAC     = _truthy("DISABLE_HMAC", "1")   # masa debug: 1
+VERIFY_PROXY     = _truthy("VERIFY_PROXY", "0")   # masa debug: 0
 
-# ===== App Proxy verification flags =====
-# Semasa debug, biar DISABLE_HMAC=1 (skip verify) & VERIFY_PROXY=0
-DISABLE_HMAC = os.getenv("DISABLE_HMAC", "1") == "1"
-VERIFY_PROXY = os.getenv("VERIFY_PROXY", "0") == "1"
+print(">>> FLAGS:",
+      "STRICT_MODE=", STRICT_MODE,
+      "DISABLE_HMAC=", DISABLE_HMAC,
+      "VERIFY_PROXY=", VERIFY_PROXY)
 
 # Categories
 CATEGORIES = ["ikhtiar_hamil", "sedang_hamil", "lain_lain"]
@@ -447,6 +452,26 @@ def _ensure_generated_table():
     except Exception as e:
         print("generated_answers init error:", e)
 _ensure_generated_table()
+
+def _ensure_kb_table():
+    try:
+        conn = _connect()
+        c = conn.cursor()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS knowledge_base_qa (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT,
+            question TEXT,
+            answer   TEXT,
+            q_embedding BLOB
+        )""")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("kb table init error:", e)
+
+_ensure_kb_table()
+
 
 # =========================
 # SMART /ask endpoint
@@ -892,3 +917,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # host=0.0.0.0 penting untuk Render
     app.run(host="0.0.0.0", port=port, debug=True)
+
