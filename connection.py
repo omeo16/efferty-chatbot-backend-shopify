@@ -1,7 +1,6 @@
 import os
 import re
 import hmac
-import base64
 import hashlib
 import sqlite3
 import numpy as np
@@ -21,36 +20,45 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_KEY:
     raise Exception("Set OPENAI_API_KEY in .env")
 
-# default timeout untuk semua request OpenAI
 client = OpenAI(api_key=OPENAI_KEY, timeout=25.0)
 
-# Models
-EMBED_MODEL = "text-embedding-3-small"   # 1536 dim
+EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL  = "gpt-4o-mini"
 
-# ---- DB path robust ----
-DB_PATH = os.getenv(
-    "DB_PATH",
-    os.path.join(os.path.dirname(__file__), "kb.db")
-)
-print(">>> DEBUG: DB_PATH =", DB_PATH, "exists?", os.path.exists(DB_PATH))
+def _truthy(name, default="false"):
+    return (os.getenv(name, default) or "").strip().lower() in ("1", "true", "yes", "y")
+
+# ---- Robust DB selection ----
+def _pick_db_path():
+    # priority: explicit env → kb.db → knowledge_base.db → kb_embeddings.sqlite
+    candidates = []
+    env_path = (os.getenv("DB_PATH") or "").strip()
+    if env_path:
+        candidates.append(env_path)
+
+    here = os.path.dirname(__file__)
+    candidates += [
+        os.path.join(here, "kb.db"),
+        os.path.join(here, "knowledge_base.db"),
+        os.path.join(here, "kb_embeddings.sqlite"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # default to kb.db in repo dir (will be created if needed)
+    return os.path.join(here, "kb.db")
+
+DB_PATH = _pick_db_path()
+print(">>> DEBUG: DB_PATH =", DB_PATH, "| exists?", os.path.exists(DB_PATH))
 
 TOP_N = 8
-SIM_THRESHOLD = 0.10
-KW_THRESHOLD  = 0.08
-
-COS_MIN       = 0.20
-KW_MIN        = 0.12
-SELECTED_MIN  = 0.24
-RESCUE_DELTA  = 0.06
-
-def _truthy(name, default="false"):
-    return (os.getenv(name, default) or "").strip().lower() in ("1","true","yes","y")
+COS_MIN, KW_MIN = 0.20, 0.12
+SELECTED_MIN, RESCUE_DELTA = 0.24, 0.06
 
 DEBUG_CANDIDATES = _truthy("DEBUG_CANDIDATES", "false")
 STRICT_MODE      = _truthy("STRICT_MODE", "false")
-DISABLE_HMAC     = _truthy("DISABLE_HMAC", "1")   # masa debug: 1
-VERIFY_PROXY     = _truthy("VERIFY_PROXY", "0")   # masa debug: 0
+DISABLE_HMAC     = _truthy("DISABLE_HMAC", "1")   # debug: 1
+VERIFY_PROXY     = _truthy("VERIFY_PROXY", "0")   # debug: 0
 
 print(">>> FLAGS:",
       "STRICT_MODE=", STRICT_MODE,
@@ -69,20 +77,17 @@ CATEGORY_FILES = {
 }
 
 # Platform URLs
-TIKTOK_URL  = os.getenv("TIKTOK_URL",  "https://www.tiktok.com/@efferty?is_from_webapp=1&sender_device=pc")
-SHOPEE_URL  = os.getenv("SHOPEE_URL",  "https://shopee.com.my/efferty")
-WEBSITE_URL = os.getenv("WEBSITE_URL", "https://deals.efferty.com")
-WHATSAPP_URL = os.getenv("WHATSAPP_URL" ,"https://wa.me/601126259641?text=Hi%2C+saya+ingin+mengetahui+lebih+lanjut+mengenai+Efferty.")
+TIKTOK_URL   = os.getenv("TIKTOK_URL",  "https://www.tiktok.com/@efferty?is_from_webapp=1&sender_device=pc")
+SHOPEE_URL   = os.getenv("SHOPEE_URL",  "https://shopee.com.my/efferty")
+WEBSITE_URL  = os.getenv("WEBSITE_URL", "https://deals.efferty.com")
+WHATSAPP_URL = os.getenv("WHATSAPP_URL","https://wa.me/601126259641?text=Hi%2C+saya+ingin+mengetahui+lebih+lanjut+mengenai+Efferty.")
 
-# Smart justification
-JUSTIFY_MODE = os.getenv("JUSTIFY_MODE", "true").lower() == "true"
-
+JUSTIFY_MODE = _truthy("JUSTIFY_MODE", "true")
 SMART_DISCLAIMER = os.getenv(
     "SMART_DISCLAIMER",
     "Disclaimer: Sesetengah informasi kemungkinan tidak tepat, sila hubungi kumpulan kami untuk maklumat lanjut. Sila tekan butang 4."
 )
 
-# Shopify HMAC (untuk App Proxy)
 SHOPIFY_SHARED_SECRET = os.getenv("SHOPIFY_SHARED_SECRET", "")
 
 app = Flask(__name__)
@@ -91,9 +96,6 @@ CORS(app)
 # =========================
 # Helpers
 # =========================
-def _escape_regex(s: str) -> str:
-    return re.escape(s)
-
 def linkify_platforms(text: str) -> str:
     if not text or "<a " in text.lower():
         return text
@@ -108,10 +110,7 @@ def linkify_platforms(text: str) -> str:
         labels_sorted = sorted(labels, key=len, reverse=True)
         alt = "|".join(re.escape(x) for x in labels_sorted)
         regex = re.compile(rf"(?<![\w/])({alt})(?![^<]*>)", re.IGNORECASE)
-        def _repl(m):
-            label = m.group(1)
-            return f'<a href="{url}" target="_blank" rel="noopener">{label}</a>'
-        html = regex.sub(_repl, html)
+        html = regex.sub(lambda m: f'<a href="{url}" target="_blank" rel="noopener">{m.group(1)}</a>', html)
     return html
 
 def _connect():
@@ -133,24 +132,20 @@ def _expand_query(q: str) -> str:
     ql = (q or "").lower()
     extra = []
     for key, alts in BM_SYNONYMS.items():
-        if key in ql:
-            extra.extend(alts)
+        if key in ql: extra.extend(alts)
     return q if not extra else f"{q} " + " ".join(sorted(set(extra)))
 
-# ---------- hardened embed ----------
 def _embed(text: str) -> np.ndarray:
-    """Return embedding or zero-vector (length 1536) on failure."""
     try:
         resp = client.embeddings.create(model=EMBED_MODEL, input=text)
         return np.asarray(resp.data[0].embedding, dtype=np.float32)
     except Exception as e:
         print("EMBED error:", e)
-        return np.zeros(1536, dtype=np.float32)  # 1536 for text-embedding-3-small
+        return np.zeros(1536, dtype=np.float32)
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
+    if na == 0 or nb == 0: return 0.0
     return float(np.dot(a, b) / (na * nb))
 
 def _tokens(s: str):
@@ -158,8 +153,7 @@ def _tokens(s: str):
 
 def _kw_overlap(query: str, text: str) -> float:
     A, B = set(_tokens(query)), set(_tokens(text))
-    if not A or not B:
-        return 0.0
+    if not A or not B: return 0.0
     return len(A & B) / len(A | B)
 
 def _clean_prefixes(s: str) -> str:
@@ -173,33 +167,30 @@ def _normalize(s: str) -> str:
 
 def _looks_like_why(q: str) -> bool:
     ql = (q or "").lower()
-    return any(w in ql for w in ["kenapa", "mengapa", "sebab", "why", "justifikasi", "justify"])
+    return any(w in ql for w in ["kenapa","mengapa","sebab","why","justifikasi","justify"])
 
 def _looks_like_how(q: str) -> bool:
     ql = (q or "").lower()
-    return any(w in ql for w in ["bagaimana", "macam mana", "how"])
+    return any(w in ql for w in ["bagaimana","macam mana","how"])
 
 def _looks_like_catalog(answer: str) -> bool:
     a = (answer or "").lower().strip()
     has_list_markers = bool(re.search(r"\b(\d+\.\s|1\)|•|- )", a))
     starts_with_terdapat = a.startswith("terdapat ")
     many_commas = a.count(",") >= 3
-    keywords = any(k in a for k in ["kategori", "perisa", "pilihan", "signature", "essential", "premium"])
+    keywords = any(k in a for k in ["kategori","perisa","pilihan","signature","essential","premium"])
     return has_list_markers or starts_with_terdapat or (many_commas and keywords)
 
 def _normalize_cat_for_ask(cat_in: str) -> str:
     c = (cat_in or "").strip().lower().replace("-", "_")
-    if c in {"1", "ikhtiar_hamil", "ikhtiar hamil", "ikhtiar", "subur"}:
-        return "Ikhtiar Hamil"
-    if c in {"2", "sedang_hamil", "sedang hamil", "hamil", "pregnant"}:
-        return "Sedang Hamil"
+    if c in {"1","ikhtiar_hamil","ikhtiar hamil","ikhtiar","subur"}: return "Ikhtiar Hamil"
+    if c in {"2","sedang_hamil","sedang hamil","hamil","pregnant"}: return "Sedang Hamil"
     return "Lain-Lain"
 
-# -------- tolerant extractor for message + category --------
 def _get_msg_and_cat(req):
     data = req.get_json(silent=True) or {}
-    keys_msg = ["message", "msg", "text", "query", "q", "prompt", "content", "question"]
-    keys_cat = ["category", "cat", "kategori", "group", "topic", "kategory"]
+    keys_msg = ["message","msg","text","query","q","prompt","content","question"]
+    keys_cat = ["category","cat","kategori","group","topic","kategory"]
 
     def pick(d, keys):
         for k in keys:
@@ -208,27 +199,18 @@ def _get_msg_and_cat(req):
                 return str(v).strip()
         return ""
 
-    msg = pick(data, keys_msg)
-    cat = pick(data, keys_cat)
-
-    if not msg:
-        msg = pick(request.values, keys_msg)
-    if not cat:
-        cat = pick(request.values, keys_cat)
-
-    if not msg:
-        msg = pick(request.args, keys_msg)
-    if not cat:
-        cat = pick(request.args, keys_cat)
-
+    msg = pick(data, keys_msg); cat = pick(data, keys_cat)
+    if not msg: msg = pick(request.values, keys_msg)
+    if not cat: cat = pick(request.values, keys_cat)
+    if not msg: msg = pick(request.args, keys_msg)
+    if not cat: cat = pick(request.args, keys_cat)
     return msg, cat
 
 # =========================
 # Retrieval & re-ranking
 # =========================
 def _load_qa_rows(category: str):
-    conn = _connect()
-    c = conn.cursor()
+    conn = _connect(); c = conn.cursor()
     try:
         c.execute("""
             SELECT id, question, answer, q_embedding
@@ -245,19 +227,16 @@ def _load_qa_rows(category: str):
     items = []
     for row in rows:
         emb_blob = row["q_embedding"]
-        if emb_blob is None:
-            continue
+        if emb_blob is None: continue
         emb = np.frombuffer(emb_blob, dtype=np.float32)
         items.append({"id": row["id"], "q": row["question"], "a": row["answer"], "emb": emb})
     return items
 
 def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
     rows = _load_qa_rows(category)
-    if not rows:
-        return []
+    if not rows: return []
     qvec = _embed(_expand_query(question))
-    if not qvec.any():
-        return []
+    if not qvec.any(): return []
     scored = []
     for r in rows:
         cos = _cosine(qvec, r["emb"])
@@ -272,27 +251,22 @@ def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
         r["score"] = cos_w * r["cos"] + kw_w * r["kw"]
     cand.sort(key=lambda x: x["score"], reverse=True)
     if DEBUG_CANDIDATES:
-        print("[DEBUG] top candidates:")
         for r in cand[:5]:
             print(f"  score={r['score']:.3f} cos={r['cos']:.3f} kw={r['kw']:.3f}  Q={r['q'][:80]}")
     return cand
 
 def retrieve_candidates_any(question: str, top_n: int = TOP_N):
-    best = None
-    best_cat = None
+    best = None; best_cat = None
     for cat in CATEGORIES:
         cands = retrieve_candidates(question, cat, top_n=top_n)
-        if not cands:
-            continue
+        if not cands: continue
         top = cands[0]
         if (best is None) or (top["score"] > best["score"]):
-            best = top
-            best_cat = cat
+            best = top; best_cat = cat
     return best, best_cat
 
 def related_kb_questions(question: str, category: str, exclude_q: str = None, n: int = 3):
-    conn = _connect()
-    c = conn.cursor()
+    conn = _connect(); c = conn.cursor()
     try:
         c.execute("""
             SELECT id, question, q_embedding
@@ -304,16 +278,13 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
         rows = []
     finally:
         conn.close()
-    if not rows:
-        return []
+    if not rows: return []
     qvec = _embed(_expand_query(question))
-    if not qvec.any():
-        return []
+    if not qvec.any(): return []
     scored = []
     for row in rows:
         q_text = row["question"]
-        if exclude_q and q_text.strip().lower() == exclude_q.strip().lower():
-            continue
+        if exclude_q and q_text.strip().lower() == exclude_q.strip().lower(): continue
         emb = np.frombuffer(row["q_embedding"], dtype=np.float32)
         cos = _cosine(qvec, emb)
         scored.append((cos, q_text))
@@ -324,10 +295,8 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
 # Grounded justification helpers
 # =========================
 def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_chars: int = 1800) -> str:
-    conn = _connect()
-    c = conn.cursor()
-    if not keywords:
-        return ""
+    conn = _connect(); c = conn.cursor()
+    if not keywords: return ""
     kw_like = " OR ".join(["question LIKE ? OR answer LIKE ?"] * len(keywords))
     params = []
     for kw in keywords:
@@ -347,33 +316,26 @@ def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_char
         rows = []
     finally:
         conn.close()
-    chunks = []
-    total = 0
+    chunks = []; total = 0
     for r in rows:
         block = f"Q: {r['question']}\nA: {r['answer']}\n"
         total += len(block)
-        if total > max_chars:
-            break
+        if total > max_chars: break
         chunks.append(block)
     return "\n".join(chunks).strip()
 
 def _need_explanation(user_q: str, kb_answer: str) -> bool:
-    q = _normalize(user_q)
-    a = _normalize(kb_answer)
-    trigger_words = ["kenapa", "mengapa", "sebab", "why", "justifikasi", "justify"]
-    cond_words    = ["pcos", "endometriosis", "fibroid", "cyst", "haid", "period"]
-    ask_why = any(w in q for w in trigger_words)
-    mention_cond = any(w in q for w in cond_words)
-    looks_short = len(a) <= 90
-    return (ask_why or mention_cond) and looks_short
+    q = _normalize(user_q); a = _normalize(kb_answer)
+    trigger = ["kenapa","mengapa","sebab","why","justifikasi","justify"]
+    cond = ["pcos","endometriosis","fibroid","cyst","haid","period"]
+    return (any(w in q for w in trigger) or any(w in q for w in cond)) and (len(a) <= 90)
 
 def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
     base_tokens = re.findall(r"[a-zA-Z0-9]+", (user_q + " " + kb_answer), flags=re.I)
-    extra = ["efferty", "susu", "cinnamon", "coklat", "pcos", "sesuai", "kandungan", "cara", "pengambilan"]
+    extra = ["efferty","susu","cinnamon","coklat","pcos","sesuai","kandungan","cara","pengambilan"]
     keywords = list(dict.fromkeys([t.lower() for t in base_tokens + extra if len(t) >= 3]))
     context = _gather_fact_context(category, keywords)
-    if not context:
-        return ""
+    if not context: return ""
     system_prompt = (
         "You are EffertyAskMe. Provide a SHORT explanation in the user's language "
         "based ONLY on the provided Knowledge Base facts.\n"
@@ -394,8 +356,7 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
             model=CHAT_MODEL, messages=messages, temperature=0.2, max_tokens=160
         )
         expl = _clean_prefixes((chat.choices[0].message.content or "").strip())
-        if len(_normalize(expl)) < 12:
-            return ""
+        if len(_normalize(expl)) < 12: return ""
         return expl
     except Exception as e:
         print("Justifier error:", e)
@@ -405,8 +366,7 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
 # TXT sync + admin learning table
 # =========================
 def _qa_pairs_for_category(category: str):
-    conn = _connect()
-    c = conn.cursor()
+    conn = _connect(); c = conn.cursor()
     try:
         c.execute("""SELECT question, answer FROM knowledge_base_qa WHERE category = ? ORDER BY id ASC""", (category,))
         rows = c.fetchall()
@@ -419,7 +379,6 @@ def _sync_category_txt(category: str):
     if not fname:
         print(f"[SYNC] No txt mapping for category: {category}")
         return
-    import os
     os.makedirs(BASE_FOLDER, exist_ok=True)
     path = os.path.join(BASE_FOLDER, fname)
     pairs = _qa_pairs_for_category(category)
@@ -435,8 +394,7 @@ def _sync_category_txt(category: str):
 
 def _ensure_generated_table():
     try:
-        conn = _connect()
-        c = conn.cursor()
+        conn = _connect(); c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS generated_answers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -447,16 +405,13 @@ def _ensure_generated_table():
                 approved INTEGER DEFAULT 0
             )
         """)
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
     except Exception as e:
         print("generated_answers init error:", e)
-_ensure_generated_table()
 
 def _ensure_kb_table():
     try:
-        conn = _connect()
-        c = conn.cursor()
+        conn = _connect(); c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_base_qa (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -465,13 +420,12 @@ def _ensure_kb_table():
             answer   TEXT,
             q_embedding BLOB
         )""")
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
     except Exception as e:
         print("kb table init error:", e)
 
+_ensure_generated_table()
 _ensure_kb_table()
-
 
 # =========================
 # SMART /ask endpoint
@@ -483,14 +437,9 @@ def ask():
         category = data.get("category")
         question  = (data.get("question") or "").strip()
 
-        # ---------- STRICT short-circuit (no OpenAI/DB) ----------
         if STRICT_MODE:
             fallback = "Harap maaf. Sila berhubung dengan agent kami untuk mengetahui lebih lanjut dengan menekan butang 4."
-            return jsonify({
-                "answer": linkify_platforms(fallback),
-                "suggestions": [],
-                "used_context": False
-            }), 200
+            return jsonify({"answer": linkify_platforms(fallback), "suggestions": [], "used_context": False}), 200
 
         history       = data.get("history") or []
         prev_question = (data.get("prev_question") or "").strip()
@@ -501,12 +450,8 @@ def ask():
             return jsonify({"error": "Please provide category and question"}), 400
 
         mapping = {
-            "1": "ikhtiar_hamil",
-            "2": "sedang_hamil",
-            "3": "lain_lain",
-            "Ikhtiar Hamil": "ikhtiar_hamil",
-            "Sedang Hamil": "sedang_hamil",
-            "Lain-Lain": "lain_lain"
+            "1": "ikhtiar_hamil", "2": "sedang_hamil", "3": "lain_lain",
+            "Ikhtiar Hamil": "ikhtiar_hamil", "Sedang Hamil": "sedang_hamil", "Lain-Lain": "lain_lain"
         }
         cat_key = mapping.get(str(category))
         if not cat_key:
@@ -525,7 +470,7 @@ def ask():
             if prev_answer:
                 ctx_q, ctx_a, ctx_cat = prev_question, prev_answer, (prev_category or cat_key)
             elif history:
-                last_bot = next((m.get("content","") for m in reversed(history) if m.get("role") == "assistant"), "")
+                last_bot  = next((m.get("content","") for m in reversed(history) if m.get("role") == "assistant"), "")
                 last_user = next((m.get("content","") for m in reversed(history) if m.get("role") == "user"), "")
                 ctx_q, ctx_a, ctx_cat = (last_user or question), last_bot, cat_key
             if ctx_a and len(_normalize(ctx_a)) > 8:
@@ -540,8 +485,7 @@ def ask():
 
         def _score_ok(r):
             if not r: return False
-            cos = r.get("cos", 0.0)
-            kw  = r.get("kw", 0.0)
+            cos = r.get("cos", 0.0); kw = r.get("kw", 0.0)
             return (cos >= 0.26) or (cos >= COS_MIN and kw >= KW_MIN)
 
         selected_ok = _score_ok(best)
@@ -554,11 +498,7 @@ def ask():
             use_kb = True
         else:
             if global_best and _score_ok(global_best) and (global_score - selected_score >= RESCUE_DELTA):
-                best = global_best
-                cat_key = global_cat
-                use_kb = True
-            else:
-                use_kb = False
+                best = global_best; cat_key = global_cat; use_kb = True
 
         if use_kb:
             need_selector = False
@@ -602,8 +542,7 @@ def ask():
 
                 if JUSTIFY_MODE and _need_explanation(question, answer):
                     extra = _justify_answer(question, answer, cat_key)
-                    if extra:
-                        answer = f"{answer}\n\n{extra}"
+                    if extra: answer = f"{answer}\n\n{extra}"
 
                 try:
                     if user_lang == "en":
@@ -630,9 +569,7 @@ def ask():
             chat = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.0, max_tokens=1000)
             answer = _clean_prefixes(chat.choices[0].message.content.strip())
 
-            if answer.strip().lower().startswith("harap maaf"):
-                use_kb = False
-            else:
+            if not answer.strip().lower().startswith("harap maaf"):
                 try:
                     if detect(question) == "en":
                         answer = GoogleTranslator(source="auto", target="en").translate(answer)
@@ -645,9 +582,7 @@ def ask():
         # fallback Smart GPT
         print("Smart GPT")
         kb_best, kb_cat = retrieve_candidates_any(question, TOP_N)
-        kb_context = ""
-        if kb_best:
-            kb_context = f"Q: {kb_best['q']}\nA: {kb_best['a']}"
+        kb_context = f"Q: {kb_best['q']}\nA: {kb_best['a']}" if kb_best else ""
 
         sys = (
             "You are EffertyAskMe — an empathetic, knowledgeable assistant for Efferty Milk. "
@@ -655,16 +590,13 @@ def ask():
             "Avoid medical claims/diagnosis. If price/promo/stock/uncertain → advise contacting our team."
         )
         msgs = [{"role": "system", "content": sys}]
-        if kb_context:
-            msgs.append({"role": "system", "content": f"KB Context (use only if relevant):\n{kb_context}"})
+        if kb_context: msgs.append({"role": "system", "content": f"KB Context (use only if relevant):\n{kb_context}"})
         for m in history[-6:]:
-            if m.get("role") in ("user", "assistant") and m.get("content"):
+            if m.get("role") in ("user","assistant") and m.get("content"):
                 msgs.append({"role": m.get("role"), "content": m.get("content")})
         msgs.append({"role": "user", "content": question})
 
-        chat = client.chat.completions.create(
-            model=CHAT_MODEL, messages=msgs, temperature=0.7, max_tokens=600
-        )
+        chat = client.chat.completions.create(model=CHAT_MODEL, messages=msgs, temperature=0.7, max_tokens=600)
         answer = _clean_prefixes(chat.choices[0].message.content.strip())
 
         try:
@@ -676,81 +608,62 @@ def ask():
         answer = f"{answer}\n\n{SMART_DISCLAIMER}"
 
         try:
-            conn = _connect()
-            c = conn.cursor()
+            conn = _connect(); c = conn.cursor()
             c.execute(
                 "INSERT INTO generated_answers (category, user_question, ai_answer) VALUES (?, ?, ?)",
                 (kb_cat or "lain_lain", question, answer)
             )
-            conn.commit()
-            conn.close()
+            conn.commit(); conn.close()
         except Exception:
             pass
 
-        suggestions = related_kb_questions(
-            question, kb_cat or "lain_lain", exclude_q=best["q"] if best else None, n=3
-        )
-        return jsonify({
-            "answer": linkify_platforms(answer),
-            "suggestions": suggestions,
-            "used_context": True
-        })
-
+        suggestions = related_kb_questions(question, kb_cat or "lain_lain", exclude_q=best["q"] if best else None, n=3)
+        return jsonify({"answer": linkify_platforms(answer), "suggestions": suggestions, "used_context": True})
     except Exception as e:
+        # Friendly fallback instead of 500 so UI tak throw "server error"
         print("Server error:", e)
-        return jsonify({"error": "Internal Server Error"}), 500
+        msg = "Harap maaf. Terjadi ralat pada pelayan. Cuba tanya semula, atau tekan butang 4 untuk hubungi kami."
+        return jsonify({"answer": linkify_platforms(msg), "suggestions": [], "used_context": False}), 200
 
 # =========================
-# App Proxy signature helper (Shopify expects query param verification)
+# App Proxy signature helper
 # =========================
 def _verify_app_proxy_signature(req) -> bool:
-    """
-    Shopify App Proxy: verify 'signature' = HMAC-SHA256(secret, path + '?' + sorted_query_without_signature) hex.
-    """
     try:
         sig = req.args.get("signature")
-        if not sig or not SHOPIFY_SHARED_SECRET:
-            return False
+        if not sig or not SHOPIFY_SHARED_SECRET: return False
         pairs = [(k, v) for k, v in req.args.items() if k != "signature"]
         pairs.sort(key=lambda kv: kv[0])
         qs = "&".join([f"{k}={v}" for k, v in pairs])
         base = req.path + (("?" + qs) if qs else "")
-        digest = hmac.new(
-            SHOPIFY_SHARED_SECRET.encode("utf-8"),
-            base.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
+        digest = hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(digest, sig)
     except Exception:
         return False
 
 # =========================
-# Shopify App Proxy endpoint (+ alias)
+# Shopify App Proxy (+ alias)
 # =========================
-@app.route("/proxy", methods=["GET", "POST"])
+@app.route("/proxy", methods=["GET","POST"])
 @app.route("/proxy/", methods=["GET","POST"])
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
 def proxy(_extra=None):
     try:
-        # --- VERIFY (optional; disable semasa debug) ---
         if not DISABLE_HMAC and VERIFY_PROXY and SHOPIFY_SHARED_SECRET:
             if not _verify_app_proxy_signature(request):
-                # 200 + JSON supaya Shopify tak render error page
                 return jsonify({"error": "bad_signature"}), 200
 
         msg, cat_raw = _get_msg_and_cat(request)
 
-        # Self test / ping via proxy
         if request.method == "GET" and request.args.get("selftest") == "1":
             return jsonify({"ok": True, "echo": msg, "category": cat_raw}), 200
 
         if request.method == "GET" and not msg:
             return jsonify({"ok": True, "via": "shopify-proxy", "hint": "POST {message:'hello',category:'2'}"}), 200
         if not msg:
-            return jsonify({"error": "missing message"}), 200  # 200 to avoid Shopify error page
+            return jsonify({"error": "missing message"}), 200
 
         cat_for_ask = _normalize_cat_for_ask(cat_raw)
-
         payload = {"category": cat_for_ask, "question": msg}
         with app.test_request_context("/ask", method="POST", json=payload):
             return ask()
@@ -758,8 +671,8 @@ def proxy(_extra=None):
         app.logger.exception("proxy crashed")
         return jsonify({"error": "server_error", "detail": str(e)}), 200
 
-@app.route("/apps/chatbot", methods=["GET", "POST"])
-@app.route("/apps/chatbot/<path:_rest>", methods=["GET", "POST"])
+@app.route("/apps/chatbot", methods=["GET","POST"])
+@app.route("/apps/chatbot/<path:_rest>", methods=["GET","POST"])
 def proxy_alias(_rest=None):
     return proxy(_rest)
 
@@ -788,18 +701,14 @@ def admin_list_qa():
         limit = min(max(int(request.args.get("limit", 25)), 1), 200)
         offset = (page - 1) * limit
 
-        conn = _connect()
-        c = conn.cursor()
-
+        conn = _connect(); c = conn.cursor()
         base_sql = "FROM knowledge_base_qa WHERE 1=1"
         params = []
         if category:
-            base_sql += " AND category=?"
-            params.append(category)
+            base_sql += " AND category=?"; params.append(category)
         if query:
             base_sql += " AND (question LIKE ? OR answer LIKE ?)"
-            like = f"%{query}%"
-            params.extend([like, like])
+            like = f"%{query}%"; params.extend([like, like])
 
         c.execute(f"SELECT COUNT(*) {base_sql}", params)
         total = c.fetchone()[0]
@@ -808,8 +717,7 @@ def admin_list_qa():
             f"SELECT id, category, question, answer {base_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
             (*params, limit, offset)
         )
-        rows = c.fetchall()
-        conn.close()
+        rows = c.fetchall(); conn.close()
 
         items = [dict(id=r["id"], category=r["category"], question=r["question"], answer=r["answer"]) for r in rows]
         return jsonify({"items": items, "total": total, "page": page, "limit": limit})
@@ -830,15 +738,12 @@ def admin_create_qa():
             return jsonify({"error": "Invalid category"}), 400
 
         emb = _embed(question).tobytes()
-        conn = _connect()
-        c = conn.cursor()
+        conn = _connect(); c = conn.cursor()
         c.execute(
             "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (?, ?, ?, ?)",
             (category, question, answer, emb)
         )
-        new_id = c.lastrowid
-        conn.commit()
-        conn.close()
+        new_id = c.lastrowid; conn.commit(); conn.close()
 
         _sync_category_txt(category)
         return jsonify({"id": new_id, "category": category, "question": question, "answer": answer})
@@ -854,14 +759,11 @@ def admin_update_qa(item_id):
         question = data.get("question")
         answer   = data.get("answer")
 
-        conn = _connect()
-        c = conn.cursor()
-
+        conn = _connect(); c = conn.cursor()
         c.execute("SELECT category, question, answer FROM knowledge_base_qa WHERE id=?", (item_id,))
         row = c.fetchone()
         if not row:
-            conn.close()
-            return jsonify({"error": "Not found"}), 404
+            conn.close(); return jsonify({"error": "Not found"}), 404
 
         old_cat = row["category"]
         new_cat = category if category else row["category"]
@@ -872,17 +774,12 @@ def admin_update_qa(item_id):
         sql = "UPDATE knowledge_base_qa SET category=?, question=?, answer=?"
         if new_q != row["question"]:
             new_emb = _embed(new_q).tobytes()
-            sql += ", q_embedding=?"
-            params.append(new_emb)
-        sql += " WHERE id=?"
-        params.append(item_id)
+            sql += ", q_embedding=?"; params.append(new_emb)
+        sql += " WHERE id=?"; params.append(item_id)
 
-        c.execute(sql, params)
-        conn.commit()
-        conn.close()
+        c.execute(sql, params); conn.commit(); conn.close()
 
-        if new_cat != old_cat:
-            _sync_category_txt(old_cat)
+        if new_cat != old_cat: _sync_category_txt(old_cat)
         _sync_category_txt(new_cat)
 
         return jsonify({"id": item_id, "category": new_cat, "question": new_q, "answer": new_a})
@@ -893,21 +790,17 @@ def admin_update_qa(item_id):
 @app.route("/admin/qa/<int:item_id>", methods=["DELETE"])
 def admin_delete_qa(item_id):
     try:
-        conn = _connect()
-        c = conn.cursor()
+        conn = _connect(); c = conn.cursor()
         c.execute("SELECT category FROM knowledge_base_qa WHERE id=?", (item_id,))
         r = c.fetchone()
         if not r:
-            conn.close()
-            return jsonify({"error": "Not found"}), 404
+            conn.close(); return jsonify({"error": "Not found"}), 404
         cat = r["category"]
 
         c.execute("DELETE FROM knowledge_base_qa WHERE id=?", (item_id,))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
 
         _sync_category_txt(cat)
-
         return jsonify({"ok": True})
     except Exception as e:
         print("Admin delete error:", e)
@@ -915,6 +808,4 @@ def admin_delete_qa(item_id):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # host=0.0.0.0 penting untuk Render
     app.run(host="0.0.0.0", port=port, debug=True)
-
