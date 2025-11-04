@@ -47,6 +47,11 @@ STRICT_MODE = os.getenv("STRICT_MODE", "false").lower() == "true"
 print(">>> DEBUG: STRICT_MODE from .env =", os.getenv("STRICT_MODE"))
 print(">>> DEBUG: parsed STRICT_MODE =", STRICT_MODE)
 
+# ===== App Proxy verification flags =====
+# Semasa debug, biar DISABLE_HMAC=1 (skip verify) & VERIFY_PROXY=0
+DISABLE_HMAC = os.getenv("DISABLE_HMAC", "1") == "1"
+VERIFY_PROXY = os.getenv("VERIFY_PROXY", "0") == "1"
+
 # Categories
 CATEGORIES = ["ikhtiar_hamil", "sedang_hamil", "lain_lain"]
 
@@ -72,7 +77,7 @@ SMART_DISCLAIMER = os.getenv(
     "Disclaimer: Sesetengah informasi kemungkinan tidak tepat, sila hubungi kumpulan kami untuk maklumat lanjut. Sila tekan butang 4."
 )
 
-# Shopify HMAC (optional — verify jika DISABLE_HMAC != 1)
+# Shopify HMAC (untuk App Proxy)
 SHOPIFY_SHARED_SECRET = os.getenv("SHOPIFY_SHARED_SECRET", "")
 
 app = Flask(__name__)
@@ -135,8 +140,7 @@ def _embed(text: str) -> np.ndarray:
         return np.asarray(resp.data[0].embedding, dtype=np.float32)
     except Exception as e:
         print("EMBED error:", e)
-        # 1536 for text-embedding-3-small
-        return np.zeros(1536, dtype=np.float32)
+        return np.zeros(1536, dtype=np.float32)  # 1536 for text-embedding-3-small
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -576,11 +580,11 @@ def ask():
                     if extra:
                         answer = f"{answer}\n\n{extra}"
 
-                if user_lang == "en":
-                    try:
+                try:
+                    if user_lang == "en":
                         answer = GoogleTranslator(source="auto", target="en").translate(answer)
-                    except Exception as e:
-                        print("Translation error:", e)
+                except Exception as e:
+                    print("Translation error:", e)
 
                 answer = linkify_platforms(answer)
                 suggestions = related_kb_questions(question, cat_key, exclude_q=best["q"], n=3)
@@ -613,7 +617,7 @@ def ask():
                 suggestions = related_kb_questions(question, cat_key, n=3)
                 return jsonify({"answer": answer, "suggestions": suggestions, "used_context": False})
 
-        # fallback Smart GPT (tak kena bila STRICT_MODE true sbb dah return awal)
+        # fallback Smart GPT
         print("Smart GPT")
         kb_best, kb_cat = retrieve_candidates_any(question, TOP_N)
         kb_context = ""
@@ -672,42 +676,76 @@ def ask():
         return jsonify({"error": "Internal Server Error"}), 500
 
 # =========================
+# App Proxy signature helper (Shopify expects query param verification)
+# =========================
+def _verify_app_proxy_signature(req) -> bool:
+    """
+    Shopify App Proxy: verify 'signature' = HMAC-SHA256(secret, path + '?' + sorted_query_without_signature) hex.
+    """
+    try:
+        sig = req.args.get("signature")
+        if not sig or not SHOPIFY_SHARED_SECRET:
+            return False
+        pairs = [(k, v) for k, v in req.args.items() if k != "signature"]
+        pairs.sort(key=lambda kv: kv[0])
+        qs = "&".join([f"{k}={v}" for k, v in pairs])
+        base = req.path + (("?" + qs) if qs else "")
+        digest = hmac.new(
+            SHOPIFY_SHARED_SECRET.encode("utf-8"),
+            base.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(digest, sig)
+    except Exception:
+        return False
+
+# =========================
 # Shopify App Proxy endpoint (+ alias)
 # =========================
 @app.route("/proxy", methods=["GET", "POST"])
 @app.route("/proxy/", methods=["GET","POST"])
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
 def proxy(_extra=None):
-    # --- optional HMAC verify ---
-    if SHOPIFY_SHARED_SECRET and os.getenv("DISABLE_HMAC", "0") != "1":
-        incoming_hmac = request.headers.get("X-Shopify-Hmac-Sha256", "")
-        raw = request.get_data() if request.method == "POST" else request.query_string
-        digest = base64.b64encode(hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
-        if not hmac.compare_digest(digest, incoming_hmac):
-            return jsonify({"error": "invalid hmac"}), 401
+    try:
+        # --- VERIFY (optional; disable semasa debug) ---
+        if not DISABLE_HMAC and VERIFY_PROXY and SHOPIFY_SHARED_SECRET:
+            if not _verify_app_proxy_signature(request):
+                # 200 + JSON supaya Shopify tak render error page
+                return jsonify({"error": "bad_signature"}), 200
 
-    msg, cat_raw = _get_msg_and_cat(request)
+        msg, cat_raw = _get_msg_and_cat(request)
 
-    if request.method == "GET" and not msg:
-        return jsonify({"ok": True, "via": "shopify-proxy", "hint": "POST {message:'hello',category:'2'}"}), 200
-    if not msg:
-        return jsonify({"error": "missing message"}), 400
+        # Self test / ping via proxy
+        if request.method == "GET" and request.args.get("selftest") == "1":
+            return jsonify({"ok": True, "echo": msg, "category": cat_raw}), 200
 
-    cat_for_ask = _normalize_cat_for_ask(cat_raw)
+        if request.method == "GET" and not msg:
+            return jsonify({"ok": True, "via": "shopify-proxy", "hint": "POST {message:'hello',category:'2'}"}), 200
+        if not msg:
+            return jsonify({"error": "missing message"}), 200  # 200 to avoid Shopify error page
 
-    payload = {"category": cat_for_ask, "question": msg}
-    with app.test_request_context("/ask", method="POST", json=payload):
-        return ask()
+        cat_for_ask = _normalize_cat_for_ask(cat_raw)
+
+        payload = {"category": cat_for_ask, "question": msg}
+        with app.test_request_context("/ask", method="POST", json=payload):
+            return ask()
+    except Exception as e:
+        app.logger.exception("proxy crashed")
+        return jsonify({"error": "server_error", "detail": str(e)}), 200
 
 @app.route("/apps/chatbot", methods=["GET", "POST"])
 @app.route("/apps/chatbot/<path:_rest>", methods=["GET", "POST"])
 def proxy_alias(_rest=None):
     return proxy(_rest)
 
-# Simple healthcheck
+# Simple healthcheck & ping
 @app.get("/")
 def health():
     return jsonify({"ok": True, "service": "efferty-chatbot-backend", "version": 1})
+
+@app.get("/ping")
+def ping():
+    return jsonify({"ok": True})
 
 # =========================
 # Admin API
