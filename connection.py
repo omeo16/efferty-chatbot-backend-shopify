@@ -629,17 +629,42 @@ def ask():
 # App Proxy signature helper
 # =========================
 def _verify_app_proxy_signature(req) -> bool:
+    """
+    Shopify App Proxy HMAC:
+    signature = hex(HMAC_SHA256(secret, path + '?' + sorted_raw_query_without_signature))
+    - GUNA raw query string (jangan URL-decode)
+    - Buang 'signature=' dulu, lepas tu sort ikut key
+    """
     try:
         sig = req.args.get("signature")
-        if not sig or not SHOPIFY_SHARED_SECRET: return False
-        pairs = [(k, v) for k, v in req.args.items() if k != "signature"]
-        pairs.sort(key=lambda kv: kv[0])
-        qs = "&".join([f"{k}={v}" for k, v in pairs])
-        base = req.path + (("?" + qs) if qs else "")
-        digest = hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not sig or not SHOPIFY_SHARED_SECRET:
+            return False
+
+        # 1) Ambil raw query (preserve %2F, %3A, dll)
+        raw_qs = req.query_string.decode("utf-8", "strict")  # contoh: "shop=...&path_prefix=%2Fapps%2Fchatbot&timestamp=...&signature=..."
+        if not raw_qs:
+            raw_qs = ""
+
+        # 2) Buang param 'signature' TANPA decode
+        parts = [p for p in raw_qs.split("&") if not p.startswith("signature=") and p != "signature"]
+
+        # 3) Sort ikut key (bahagian sebelum '=')
+        parts.sort(key=lambda s: s.split("=", 1)[0])
+
+        # 4) Bina base string exactly macam Shopify expect
+        base = req.path + (("?" + "&".join(parts)) if parts else "")
+
+        # 5) Kira HMAC
+        digest = hmac.new(
+            SHOPIFY_SHARED_SECRET.encode("utf-8"),
+            base.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
         return hmac.compare_digest(digest, sig)
     except Exception:
         return False
+
 
 # =========================
 # Shopify App Proxy (+ alias)
@@ -809,3 +834,4 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
