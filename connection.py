@@ -359,7 +359,7 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
     base_tokens = re.findall(r"[a-zA-Z0-9]+", (user_q + " " + kb_answer), flags=re.I)
     extra = ["efferty","susu","cinnamon","coklat","pcos","sesuai","kandungan","cara","pengambilan"]
     keywords = list(dict.fromkeys([t.lower() for t in base_tokens + extra if len(t) >= 3]))
-    context = _gather_fact_context(category, keywords)
+    context = _gather_fact_context(category)
     if not context: return ""
     system_prompt = (
         "You are EffertyAskMe. Provide a SHORT explanation in the user's language "
@@ -539,27 +539,8 @@ def ask():
                     if not extra:
                         any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
                         if any_cat:
-                            kws = list(set(_tokens(question)))
-                            facts = _gather_fact_context(any_cat, kws)
-                            if facts:
-                                expl_prompt = (
-                                    "You are EffertyAskMe. The user asked 'why/how'. "
-                                    "Use ONLY the KB facts below to give a brief rationale in the user's language. "
-                                    "Avoid medical promises; 1–5 short sentences; end with: "
-                                    "'Nasihat umum sahaja; dapatkan nasihat doktor jika ragu.'"
-                                )
-                                msgs = [
-                                    {"role":"system","content": expl_prompt},
-                                    {"role":"system","content": f"KB facts:\n{facts}"},
-                                    {"role":"user","content": question}
-                                ]
-                                try:
-                                    chat = client.chat.completions.create(
-                                        model=CHAT_MODEL, messages=msgs, temperature=0.2, max_tokens=160
-                                    )
-                                    extra = _clean_prefixes((chat.choices[0].message.content or "").strip())
-                                except Exception:
-                                    extra = ""
+                            # simple back-up explanation
+                            extra = _justify_answer(question, answer, any_cat)
                     if extra:
                         extra = linkify_platforms(extra)
                         suggestions = related_kb_questions(question, cat_key, exclude_q=best["q"], n=3)
@@ -853,7 +834,7 @@ def admin_ui():
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # =========================
-# Shopify App Proxy (+ alias)
+# 2.3 Shopify App Proxy (+ alias)
 # =========================
 @app.route("/proxy", methods=["GET","POST"])
 @app.route("/proxy/", methods=["GET","POST"])
@@ -865,34 +846,41 @@ def proxy(_extra=None):
             if not _verify_app_proxy_signature(request):
                 return jsonify({"error": "bad_signature"}), 200
 
-        # 2.3 — Admin paths via proxy
+        # --- Admin paths via proxy (/apps/chatbot/admin, /apps/chatbot/admin-api/...) ---
         path = (_extra or "").strip().lstrip("/")
         if path == "admin" and request.method == "GET":
             return admin_ui()
+
         if path.startswith("admin-api"):
+            # Map /apps/chatbot/admin-api/...  -> internal /admin/...
             rest = path[len("admin-api/"):] if path != "admin-api" else ""
-            forward_path = "/admin/" + rest
+            forward_path = "/admin/" + rest  # e.g. /admin/qa, /admin/qa/12, /admin/categories
             fmethod = request.method
             fjson = request.get_json(silent=True) if request.is_json else None
             fdata = None if fjson is not None else (request.form if request.form else None)
+
+            # Keep the same query string (contains ?key=admin_sk_xxx)
             with app.test_request_context(
                 forward_path, method=fmethod, json=fjson, data=fdata, query_string=request.query_string
             ):
-                if forward_path.startswith("/admin/qa"):
-                    if fmethod == "GET" and forward_path == "/admin/qa":
+                # dispatch to real handlers with @require_admin
+                if forward_path == "/admin/categories" and fmethod == "GET":
+                    return list_categories()
+                if forward_path == "/admin/qa":
+                    if fmethod == "GET":
                         return admin_list_qa()
-                    if fmethod == "POST" and forward_path == "/admin/qa":
+                    if fmethod == "POST":
                         return admin_create_qa()
-                    m = re.match(r"^/admin/qa/(\d+)$", forward_path)
-                    if m:
-                        item_id = int(m.group(1))
-                        if fmethod == "DELETE":
-                            return admin_delete_qa(item_id)
-                        if fmethod == "PUT":
-                            return admin_update_qa(item_id)
+                m = re.match(r"^/admin/qa/(\d+)$", forward_path)
+                if m:
+                    item_id = int(m.group(1))
+                    if fmethod == "DELETE":
+                        return admin_delete_qa(item_id)
+                    if fmethod == "PUT":
+                        return admin_update_qa(item_id)
                 return jsonify({"error":"bad admin-api route"}), 404
 
-        # normal chatbot flow
+        # --- Normal chatbot flow via proxy ---
         msg, cat_raw = _get_msg_and_cat(request)
 
         if request.method == "GET" and request.args.get("selftest") == "1":
@@ -916,7 +904,9 @@ def proxy(_extra=None):
 def proxy_alias(_rest=None):
     return proxy(_rest)
 
-# Simple healthcheck & ping
+# =========================
+# Healthcheck
+# =========================
 @app.get("/")
 def health():
     return jsonify({"ok": True, "service": "efferty-chatbot-backend", "version": 1})
