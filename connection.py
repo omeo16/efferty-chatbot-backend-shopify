@@ -654,184 +654,318 @@ def _verify_app_proxy_signature(req) -> bool:
 @app.route("/admin/ui", methods=["GET"])
 @require_admin
 def admin_ui():
-    html = """
-<!doctype html>
+    html = r"""<!doctype html>
 <html lang="ms">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Efferty Q&A Manager</title>
 <style>
-  :root{--p:#50154A}
-  *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:#faf6fb;color:#1a1a1a}
-  header{display:flex;align-items:center;gap:12px;padding:14px 16px;background:var(--p);color:#fff;position:sticky;top:0}
-  header h1{font-size:18px;margin:0;font-weight:700}
-  main{padding:16px;max-width:980px;margin:0 auto}
-  .row{display:flex;gap:12px;flex-wrap:wrap}
-  .card{background:#fff;border:1px solid #eee;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.06)}
-  .card.pad{padding:14px}
-  label{font-size:13px;color:#555}
-  input,select,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font:inherit;background:#fff}
+  :root{
+    --p:#50154A; --ink:#1a1a1a; --bg:#fbf7ff; --card:#ffffff;
+    --line:#ece6f3; --muted:#6e6276; --chip:#f3e8ff; --chip-ink:#3e205a;
+    --shadow:0 8px 28px rgba(0,0,0,.08);
+    --r:16px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
+
+  /* ===== Header (matches admin.vue) ===== */
+  .admin-header{
+    position:sticky;top:0;z-index:10;
+    display:flex;align-items:center;justify-content:space-between;
+    gap:16px;padding:14px 18px;background:var(--p);color:#fff;
+  }
+  .logo-wrap{display:flex;align-items:center;gap:12px}
+  .admin-logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 0 rgba(0,0,0,.12))}
+  .admin-header h1{margin:0;font-size:18px;font-weight:800;letter-spacing:.2px}
+  .actions{display:flex;align-items:center;gap:10px}
+  .search-bar{display:flex;align-items:center;gap:10px;background:#fff1; padding:6px;border-radius:999px}
+  .search-bar input{border:0;background:transparent;color:#fff;outline:none;min-width:240px}
+  .search-bar input::placeholder{color:#ffffffb3}
+  .actions select{
+    appearance:none;border:0;border-radius:999px;padding:8px 14px;background:#ffffff20;color:#fff;outline:none
+  }
+
+  /* ===== Buttons ===== */
+  .btn{background:var(--p);color:#fff;border:0;border-radius:999px;padding:10px 14px;font-weight:700;cursor:pointer}
+  .btn:hover{opacity:.95}
+  .btn.ghost{background:#fff;color:var(--p);border:1px solid var(--p)}
+  .btn.create{background:#fff;color:var(--p)}
+
+  /* ===== Content wrap ===== */
+  .content{max-width:1100px;margin:18px auto;padding:0 16px}
+
+  /* ===== Category cards (home) ===== */
+  .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+  .cat-card{
+    border:1px solid var(--line);background:var(--card);border-radius:var(--r);
+    padding:18px;text-align:left;box-shadow:var(--shadow);cursor:pointer;transition:.2s transform;
+  }
+  .cat-card:hover{transform:translateY(-2px)}
+  .cat-card .card-title{font-weight:800;font-size:18px;margin-bottom:4px}
+  .cat-card .card-sub{color:var(--muted);font-size:13px}
+  .cat-card.hamil{background:linear-gradient(135deg,#fff,#f7ebff)}
+  .cat-card.sedang{background:linear-gradient(135deg,#fff,#eaf7ff)}
+  .cat-card.lain{background:linear-gradient(135deg,#fff,#eafbef)}
+
+  /* ===== Toolbar (inside category) ===== */
+  .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  .toolbar-title{font-size:18px;font-weight:800}
+  .badge{display:inline-block;padding:.28rem .6rem;border-radius:999px;background:var(--chip);color:var(--chip-ink);font-size:12px}
+
+  /* ===== Table (div-based grid to match Vue) ===== */
+  .table{border:1px solid var(--line);border-radius:var(--r);background:#fff;box-shadow:var(--shadow);overflow:hidden}
+  .thead,.trow{display:grid;grid-template-columns:72px 160px 1fr 1.2fr 132px;gap:0}
+  .thead>div,.trow>div{padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}
+  .thead{background:#f4ecff;font-weight:700}
+  .trow .mono{font-family:ui-monospace,Consolas,Monaco,monospace}
+  .trow .answer{white-space:pre-wrap}
+  .row-actions{display:flex;gap:8px;justify-content:flex-end}
+  .danger{background:#fff;color:#b82a2a;border:1px solid #e2caca}
+  .empty{padding:18px;color:var(--muted)}
+
+  .pager{display:flex;align-items:center;gap:10px;justify-content:center;padding:12px}
+
+  /* ===== Modal ===== */
+  .modal{position:fixed;inset:0;background:rgba(20,0,30,.50);display:flex;align-items:center;justify-content:center;padding:16px}
+  .modal-card{
+    width:min(780px,96vw);background:#fff;border-radius:20px;border:1px solid var(--line);box-shadow:var(--shadow);padding:18px;
+  }
+  .modal-card h2{margin:0 0 12px;font-size:18px}
+  .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
+  label{font-size:13px;color:#503e58}
+  select,input,textarea{width:100%;border:1px solid #e6dff1;border-radius:12px;padding:10px 12px;font:inherit;background:#fff}
   textarea{min-height:120px;resize:vertical}
-  button{background:var(--p);color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
-  button.ghost{background:#fff;color:var(--p);border:1px solid var(--p)}
-  table{width:100%;border-collapse:collapse}
-  th,td{padding:10px;border-bottom:1px solid #eee;font-size:14px;vertical-align:top}
-  th{background:#faf0ff;text-align:left}
-  .muted{color:#666;font-size:12px}
-  .row>.col{flex:1 1 320px}
-  .danger{color:#c0392b}
-  .badge{display:inline-block;padding:.25rem .5rem;border-radius:999px;background:#f3e8ff;color:#40205f;font-size:12px}
+
+  /* small screens */
+  @media (max-width:720px){
+    .thead,.trow{grid-template-columns:56px 120px 1fr 1fr 120px}
+    .search-bar input{min-width:140px}
+  }
 </style>
 </head>
 <body>
-<header>
-  <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 6a3 3 0 0 1 3-3h8l7 7v11a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6z" stroke="white" stroke-width="1.6"/><path d="M14 3v5a2 2 0 0 0 2 2h5" stroke="white" stroke-width="1.6"/></svg>
-  <h1>Efferty Q&amp;A Manager <span class="badge">Admin</span></h1>
-</header>
-<main>
-  <div class="row">
-    <div class="col">
-      <div class="card pad">
-        <h3 style="margin:0 0 10px">Tambah Soalan</h3>
-        <div class="row">
-          <div class="col">
-            <label>Kategori</label>
-            <select id="cat">
-              <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
-              <option value="sedang_hamil">Sedang Hamil</option>
-              <option value="lain_lain">Lain-Lain</option>
-            </select>
-          </div>
-        </div>
-        <div style="margin-top:8px">
-          <label>Soalan</label>
-          <input id="q" placeholder="Tulis soalan..." />
-        </div>
-        <div style="margin-top:8px">
-          <label>Jawapan</label>
-          <textarea id="a" placeholder="Tulis jawapan penuh..."></textarea>
-        </div>
-        <div style="display:flex;gap:10px;margin-top:12px">
-          <button id="addBtn">Simpan</button>
-          <button class="ghost" id="refreshBtn">Refresh Senarai</button>
-        </div>
-        <p class="muted" style="margin-top:8px">Selepas simpan, embedding auto-generate.</p>
-      </div>
+  <!-- ===== Header ===== -->
+  <header class="admin-header">
+    <div class="logo-wrap">
+      <img class="admin-logo" src="/assets/images/logo3.png" alt="Efferty Logo" onerror="this.style.display='none'">
+      <h1>Efferty Q&amp;A Manager</h1>
     </div>
-    <div class="col">
-      <div class="card pad">
-        <h3 style="margin:0 0 10px">Cari &amp; Senarai Soalan</h3>
-        <div class="row">
-          <div class="col">
-            <label>Filter kategori</label>
-            <select id="fcat">
-              <option value="">Semua</option>
-              <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
-              <option value="sedang_hamil">Sedang Hamil</option>
-              <option value="lain_lain">Lain-Lain</option>
-            </select>
-          </div>
-          <div class="col">
-            <label>Kata kunci</label>
-            <input id="fq" placeholder="cth: PCOS, minum, waktu" />
-          </div>
-          <div class="col" style="align-self:flex-end">
-            <button id="findBtn">Cari</button>
-          </div>
+    <div class="actions">
+      <select id="hdrCat" aria-label="Pilih kategori">
+        <option value="">Semua kategori</option>
+        <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
+        <option value="sedang_hamil">Sedang Hamil</option>
+        <option value="lain_lain">Lain-Lain</option>
+      </select>
+      <div class="search-bar">
+        <input id="hdrQ" placeholder="Cari soalan / jawapan…" aria-label="Cari soalan atau jawapan">
+      </div>
+      <button class="btn create" id="hdrCreate">+ Q&amp;A</button>
+      <button class="btn" id="hdrSearch">Cari</button>
+    </div>
+  </header>
+
+  <div class="content">
+    <!-- ===== Home: category cards ===== -->
+    <div id="home" class="card-grid" role="list">
+      <button class="cat-card hamil"   data-cat="ikhtiar_hamil" role="listitem">
+        <div class="card-title">Ikhtiar Hamil</div>
+        <div class="card-sub">Q&amp;A untuk TTC, tips umum & panduan ringkas.</div>
+      </button>
+      <button class="cat-card sedang"  data-cat="sedang_hamil" role="listitem">
+        <div class="card-title">Sedang Hamil</div>
+        <div class="card-sub">Soalan lazim semasa kehamilan & pengambilan.</div>
+      </button>
+      <button class="cat-card lain"    data-cat="lain_lain" role="listitem">
+        <div class="card-title">Lain-Lain</div>
+        <div class="card-sub">Info produk am, polisi, platform & lain-lain.</div>
+      </button>
+    </div>
+
+    <!-- ===== Category view ===== -->
+    <main id="catView" class="content" style="display:none;padding:0">
+      <div class="toolbar">
+        <button class="btn ghost" id="backBtn">← Kembali</button>
+        <div class="toolbar-title"><span id="catTitle"></span> <span class="badge" id="totalLbl">0 item</span></div>
+      </div>
+
+      <div class="table">
+        <div class="thead">
+          <div>ID</div><div>Kategori</div><div>Soalan</div><div>Jawapan</div><div></div>
         </div>
+        <div id="rows"></div>
+        <div class="pager">
+          <button class="btn ghost" id="prevBtn">Sebelum</button>
+          <span id="pageLbl">1</span>
+          <button class="btn ghost" id="nextBtn">Seterusnya</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== Modal (Create/Edit) ===== -->
+  <div id="modal" class="modal" style="display:none" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h2 id="modalTitle">Tambah Q&amp;A</h2>
+      <div style="display:grid;grid-template-columns:1fr;gap:10px">
+        <label for="mcat">Kategori</label>
+        <select id="mcat">
+          <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
+          <option value="sedang_hamil">Sedang Hamil</option>
+          <option value="lain_lain">Lain-Lain</option>
+        </select>
+
+        <label for="mq">Soalan</label>
+        <textarea id="mq" rows="3" placeholder="Tulis soalan…"></textarea>
+
+        <label for="ma">Jawapan</label>
+        <textarea id="ma" rows="10" placeholder="Jawapan penuh (boleh 1., 2., … & baris baharu)"></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="saveBtn">Simpan</button>
+        <button class="btn ghost" id="closeBtn">Tutup</button>
       </div>
     </div>
   </div>
 
-  <div class="card pad" style="margin-top:14px">
-    <div style="display:flex;align-items:center;justify-content:space-between">
-      <h3 style="margin:0">Hasil</h3><span class="muted" id="totalLbl">0 item</span>
-    </div>
-    <div style="overflow:auto;margin-top:10px">
-      <table id="tbl">
-        <thead><tr><th>ID</th><th>Kategori</th><th>Soalan</th><th>Jawapan</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </div>
-</main>
 <script>
 (function(){
   const adminKey = new URLSearchParams(location.search).get('key') || '';
-  if (!adminKey) {
-    document.body.innerHTML = '<main style="padding:24px"><h2>Unauthorized</h2><p>Tiada ?key= dalam URL.</p></main>';
-    return;
-  }
-  const API = (p) => `/apps/chatbot/admin-api/${p}${p.includes('?')?'&':'?'}key=${encodeURIComponent(adminKey)}`;
+  if(!adminKey){ document.body.innerHTML = '<div class="content"><h2>Unauthorized</h2><p>Tambah <code>?key=…</code> pada URL.</p></div>'; return; }
+  const API = (p)=>`/apps/chatbot/admin-api/${p}${p.includes('?')?'&':'?'}key=${encodeURIComponent(adminKey)}`;
 
+  /* ===== State ===== */
+  let selectedCategory = '';
+  let items=[], total=0, page=1, limit=10;
+  let editingId = null;
+
+  /* ===== Helpers ===== */
   const $ = (s)=>document.querySelector(s);
-  const tblBody = document.querySelector('#tbl tbody');
-  const totalLbl = document.querySelector('#totalLbl');
+  const rows = $('#rows'), home = $('#home'), catView = $('#catView');
+  const labelCat = (c)=> c==='ikhtiar_hamil'?'Ikhtiar Hamil':(c==='sedang_hamil'?'Sedang Hamil':(c==='lain_lain'?'Lain-Lain':c));
+  const escapeHtml = (s)=>(''+s).replace(/[&<>\"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+  const truncate = (s,n)=>!s?'':(s.length>n? s.slice(0,n)+'…' : s);
 
-  async function list(page=1){
-    const fcat = document.querySelector('#fcat').value.trim();
-    const fq   = document.querySelector('#fq').value.trim();
-    const qs = new URLSearchParams({ page:String(page), limit:'50' });
-    if (fcat) qs.set('category', fcat);
-    if (fq)   qs.set('q', fq);
+  /* ===== Render ===== */
+  function showHome(){
+    home.style.display='grid'; catView.style.display='none';
+    selectedCategory=''; page=1; items=[]; total=0;
+    $('#hdrCat').value='';
+    $('#catTitle').textContent='';
+    $('#totalLbl').textContent='0 item';
+    rows.innerHTML='';
+    $('#pageLbl').textContent='1';
+  }
+  function enterCategory(cat){
+    selectedCategory = cat; page=1;
+    home.style.display='none'; catView.style.display='block';
+    $('#catTitle').textContent = labelCat(cat);
+    $('#hdrCat').value = cat;
+    loadItems();
+  }
+  function renderRows(){
+    rows.innerHTML = '';
+    if(!items.length){
+      rows.innerHTML = '<div class="empty">Tiada rekod.</div>';
+      return;
+    }
+    items.forEach(item=>{
+      const row = document.createElement('div');
+      row.className = 'trow';
+      row.innerHTML = `
+        <div>${item.id}</div>
+        <div><span class="badge">${labelCat(item.category)}</span></div>
+        <div class="mono">${escapeHtml(item.question)}</div>
+        <div class="mono answer">${escapeHtml(truncate(item.answer, 220))}</div>
+        <div class="row-actions">
+          <button class="btn ghost" data-act="edit" data-id="${item.id}">Edit</button>
+          <button class="btn danger" data-act="del" data-id="${item.id}">Delete</button>
+        </div>`;
+      rows.appendChild(row);
+    });
+    $('#totalLbl').textContent = (total||0)+' item';
+    $('#pageLbl').textContent = String(page);
+  }
 
+  /* ===== Data ops ===== */
+  async function loadItems(){
+    if(!selectedCategory) return;
+    const fq = ($('#hdrQ').value||'').trim();
+    const qs = new URLSearchParams({ category:selectedCategory, q:fq, page:String(page), limit:String(limit) });
     const res = await fetch(API('qa?'+qs.toString()));
-    if (!res.ok) throw new Error('List fail '+res.status);
     const data = await res.json();
-    tblBody.innerHTML = '';
-    (data.items||[]).forEach(item=>{
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${item.id}</td>
-        <td><span class="badge">${item.category}</span></td>
-        <td>${escapeHtml(item.question)}</td>
-        <td><div class="muted" style="max-width:420px;white-space:pre-wrap">${escapeHtml(item.answer)}</div></td>
-        <td><button data-id="${item.id}" class="del danger">Delete</button></td>
-      `;
-      tblBody.appendChild(tr);
-    });
-    totalLbl.textContent = (data.total||0) + ' item';
+    items = data.items||[]; total = data.total||0;
+    renderRows();
   }
-
-  function escapeHtml(s){ return (''+s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
-
-  async function add(){
-    const cat = document.querySelector('#cat').value.trim();
-    const q   = document.querySelector('#q').value.trim();
-    const a   = document.querySelector('#a').value.trim();
-    if (!cat || !q || !a){ alert('Lengkapkan semua field.'); return; }
-    const res = await fetch(API('qa'), {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ category:cat, question:q, answer:a })
-    });
-    if (!res.ok){ alert('Gagal simpan: '+res.status); return; }
-    await list(1);
-    document.querySelector('#q').value=''; document.querySelector('#a').value='';
+  async function createOrUpdate(){
+    const payload = {
+      category: $('#mcat').value,
+      question: ($('#mq').value||'').trim(),
+      answer:   ($('#ma').value||'').trim(),
+    };
+    if(!payload.category || !payload.question || !payload.answer){ alert('Lengkapkan semua medan.'); return; }
+    let url = 'qa', method = 'POST';
+    if(editingId){ url = `qa/${editingId}`; method = 'PUT'; }
+    const res = await fetch(API(url), { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    const data = await res.json();
+    if(data.error){ alert('Operasi gagal.'); return; }
+    closeModal(); await loadItems();
   }
-
-  async function del(id){
-    if (!confirm('Padam item '+id+'?')) return;
+  async function removeById(id){
+    if(!confirm('Padam rekod #'+id+'?')) return;
     const res = await fetch(API('qa/'+id), { method:'DELETE' });
-    if (!res.ok){ alert('Gagal padam: '+res.status); return; }
-    await list(1);
+    const data = await res.json();
+    if(!(data&&data.ok)){ alert('Gagal padam.'); return; }
+    await loadItems();
   }
 
-  document.addEventListener('click', (e)=>{
-    const btn = e.target.closest('button.del');
-    if (btn){ del(btn.getAttribute('data-id')); }
-  });
+  /* ===== Modal ===== */
+  function openCreate(){
+    editingId = null;
+    $('#modalTitle').textContent='Tambah Q&A';
+    $('#mcat').value = selectedCategory || 'ikhtiar_hamil';
+    $('#mq').value=''; $('#ma').value='';
+    $('#modal').style.display='flex';
+  }
+  function openEdit(item){
+    editingId = item.id;
+    $('#modalTitle').textContent='Kemaskini Q&A';
+    $('#mcat').value=item.category; $('#mq').value=item.question; $('#ma').value=item.answer;
+    $('#modal').style.display='flex';
+  }
+  function closeModal(){ $('#modal').style.display='none'; }
 
-  document.querySelector('#addBtn').addEventListener('click', add);
-  document.querySelector('#refreshBtn').addEventListener('click', ()=>list(1));
-  document.querySelector('#findBtn').addEventListener('click', ()=>list(1));
-  list(1);
+  /* ===== Events ===== */
+  document.addEventListener('click',(e)=>{
+    const btn=e.target.closest('[data-cat]'); if(btn) enterCategory(btn.getAttribute('data-cat'));
+    const act=e.target.closest('[data-act]'); if(act){
+      const id=Number(act.getAttribute('data-id'));
+      const item = items.find(x=>x.id===id);
+      if(act.getAttribute('data-act')==='edit') openEdit(item);
+      if(act.getAttribute('data-act')==='del') removeById(id);
+    }
+  });
+  $('#backBtn').onclick = showHome;
+  $('#prevBtn').onclick = ()=>{ if(page>1){ page--; loadItems(); } };
+  $('#nextBtn').onclick = ()=>{ if(page*limit<total){ page++; loadItems(); } };
+
+  $('#hdrCreate').onclick = ()=> selectedCategory ? openCreate() : alert('Pilih kategori dahulu (klik kad).');
+  $('#hdrSearch').onclick = ()=> selectedCategory ? (page=1, loadItems()) : alert('Pilih kategori dahulu (klik kad).');
+  $('#hdrCat').onchange = (e)=>{ const c=e.target.value; if(c){ enterCategory(c); } };
+
+  $('#saveBtn').onclick = createOrUpdate;
+  $('#closeBtn').onclick = closeModal;
+
+  // first render
+  showHome();
 })();
 </script>
 </body>
-</html>
-    """
+</html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
 
 # =========================
 # 2.3 Shopify App Proxy (+ alias)
@@ -1044,3 +1178,4 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
