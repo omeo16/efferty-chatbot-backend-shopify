@@ -1,6 +1,3 @@
-# app.py
-# -*- coding: utf-8 -*-
-
 import os
 import re
 import hmac
@@ -33,6 +30,7 @@ def _truthy(name, default="false"):
 
 # ---- Robust DB selection ----
 def _pick_db_path():
+    # priority: explicit env → kb.db → knowledge_base.db → kb_embeddings.sqlite
     candidates = []
     env_path = (os.getenv("DB_PATH") or "").strip()
     if env_path:
@@ -47,6 +45,7 @@ def _pick_db_path():
     for p in candidates:
         if os.path.exists(p):
             return p
+    # default to kb.db in repo dir (will be created if needed)
     return os.path.join(here, "kb.db")
 
 DB_PATH = _pick_db_path()
@@ -90,7 +89,6 @@ SMART_DISCLAIMER = os.getenv(
 )
 
 SHOPIFY_SHARED_SECRET = os.getenv("SHOPIFY_SHARED_SECRET", "")
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()
 
 app = Flask(__name__)
 CORS(app)
@@ -134,8 +132,7 @@ def _expand_query(q: str) -> str:
     ql = (q or "").lower()
     extra = []
     for key, alts in BM_SYNONYMS.items():
-        if key in ql:
-            extra.extend(alts)
+        if key in ql: extra.extend(alts)
     return q if not extra else f"{q} " + " ".join(sorted(set(extra)))
 
 def _embed(text: str) -> np.ndarray:
@@ -148,8 +145,7 @@ def _embed(text: str) -> np.ndarray:
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
+    if na == 0 or nb == 0: return 0.0
     return float(np.dot(a, b) / (na * nb))
 
 def _tokens(s: str):
@@ -157,8 +153,7 @@ def _tokens(s: str):
 
 def _kw_overlap(query: str, text: str) -> float:
     A, B = set(_tokens(query)), set(_tokens(text))
-    if not A or not B:
-        return 0.0
+    if not A or not B: return 0.0
     return len(A & B) / len(A | B)
 
 def _clean_prefixes(s: str) -> str:
@@ -188,10 +183,8 @@ def _looks_like_catalog(answer: str) -> bool:
 
 def _normalize_cat_for_ask(cat_in: str) -> str:
     c = (cat_in or "").strip().lower().replace("-", "_")
-    if c in {"1","ikhtiar_hamil","ikhtiar hamil","ikhtiar","subur"}:
-        return "Ikhtiar Hamil"
-    if c in {"2","sedang_hamil","sedang hamil","hamil","pregnant"}:
-        return "Sedang Hamil"
+    if c in {"1","ikhtiar_hamil","ikhtiar hamil","ikhtiar","subur"}: return "Ikhtiar Hamil"
+    if c in {"2","sedang_hamil","sedang hamil","hamil","pregnant"}: return "Sedang Hamil"
     return "Lain-Lain"
 
 def _get_msg_and_cat(req):
@@ -214,35 +207,6 @@ def _get_msg_and_cat(req):
     return msg, cat
 
 # =========================
-# 2.1 Admin Auth (token)
-# =========================
-def _get_admin_token():
-    return ADMIN_TOKEN
-
-def _pick_key_from_req(req):
-    key = req.args.get("key") or req.values.get("key") or ""
-    if key:
-        return key.strip()
-    key = req.headers.get("X-Admin-Key", "")
-    if key:
-        return key.strip()
-    auth = req.headers.get("Authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth.split(" ", 1)[1].strip()
-    return ""
-
-def require_admin(fn):
-    from functools import wraps
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        token = _get_admin_token()
-        incoming = _pick_key_from_req(request)
-        if not token or not incoming or token != incoming:
-            return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-    return wrapper
-
-# =========================
 # Retrieval & re-ranking
 # =========================
 def _load_qa_rows(category: str):
@@ -263,19 +227,16 @@ def _load_qa_rows(category: str):
     items = []
     for row in rows:
         emb_blob = row["q_embedding"]
-        if emb_blob is None:
-            continue
+        if emb_blob is None: continue
         emb = np.frombuffer(emb_blob, dtype=np.float32)
         items.append({"id": row["id"], "q": row["question"], "a": row["answer"], "emb": emb})
     return items
 
 def retrieve_candidates(question: str, category: str, top_n: int = TOP_N):
     rows = _load_qa_rows(category)
-    if not rows:
-        return []
+    if not rows: return []
     qvec = _embed(_expand_query(question))
-    if not qvec.any():
-        return []
+    if not qvec.any(): return []
     scored = []
     for r in rows:
         cos = _cosine(qvec, r["emb"])
@@ -298,8 +259,7 @@ def retrieve_candidates_any(question: str, top_n: int = TOP_N):
     best = None; best_cat = None
     for cat in CATEGORIES:
         cands = retrieve_candidates(question, cat, top_n=top_n)
-        if not cands:
-            continue
+        if not cands: continue
         top = cands[0]
         if (best is None) or (top["score"] > best["score"]):
             best = top; best_cat = cat
@@ -318,16 +278,13 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
         rows = []
     finally:
         conn.close()
-    if not rows:
-        return []
+    if not rows: return []
     qvec = _embed(_expand_query(question))
-    if not qvec.any():
-        return []
+    if not qvec.any(): return []
     scored = []
     for row in rows:
         q_text = row["question"]
-        if exclude_q and q_text.strip().lower() == exclude_q.strip().lower():
-            continue
+        if exclude_q and q_text.strip().lower() == exclude_q.strip().lower(): continue
         emb = np.frombuffer(row["q_embedding"], dtype=np.float32)
         cos = _cosine(qvec, emb)
         scored.append((cos, q_text))
@@ -337,11 +294,10 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
 # =========================
 # Grounded justification helpers
 # =========================
-def _gather_fact_context(category: str, keywords=None, limit_pairs: int = 6, max_chars: int = 1800) -> str:
+def _gather_fact_context(category: str, keywords, limit_pairs: int = 6, max_chars: int = 1800) -> str:
     conn = _connect(); c = conn.cursor()
-    if not keywords:
-        keywords = []
-    kw_like = " OR ".join(["question LIKE ? OR answer LIKE ?"] * len(keywords)) if keywords else "1=1"
+    if not keywords: return ""
+    kw_like = " OR ".join(["question LIKE ? OR answer LIKE ?"] * len(keywords))
     params = []
     for kw in keywords:
         like = f"%{kw}%"
@@ -364,8 +320,7 @@ def _gather_fact_context(category: str, keywords=None, limit_pairs: int = 6, max
     for r in rows:
         block = f"Q: {r['question']}\nA: {r['answer']}\n"
         total += len(block)
-        if total > max_chars:
-            break
+        if total > max_chars: break
         chunks.append(block)
     return "\n".join(chunks).strip()
 
@@ -379,9 +334,8 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
     base_tokens = re.findall(r"[a-zA-Z0-9]+", (user_q + " " + kb_answer), flags=re.I)
     extra = ["efferty","susu","cinnamon","coklat","pcos","sesuai","kandungan","cara","pengambilan"]
     keywords = list(dict.fromkeys([t.lower() for t in base_tokens + extra if len(t) >= 3]))
-    context = _gather_fact_context(category, keywords=keywords)
-    if not context:
-        return ""
+    context = _gather_fact_context(category, keywords)
+    if not context: return ""
     system_prompt = (
         "You are EffertyAskMe. Provide a SHORT explanation in the user's language "
         "based ONLY on the provided Knowledge Base facts.\n"
@@ -402,8 +356,7 @@ def _justify_answer(user_q: str, kb_answer: str, category: str) -> str:
             model=CHAT_MODEL, messages=messages, temperature=0.2, max_tokens=160
         )
         expl = _clean_prefixes((chat.choices[0].message.content or "").strip())
-        if len(_normalize(expl)) < 12:
-            return ""
+        if len(_normalize(expl)) < 12: return ""
         return expl
     except Exception as e:
         print("Justifier error:", e)
@@ -561,7 +514,27 @@ def ask():
                     if not extra:
                         any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
                         if any_cat:
-                            extra = _justify_answer(question, answer, any_cat)
+                            kws = list(set(_tokens(question)))
+                            facts = _gather_fact_context(any_cat, kws)
+                            if facts:
+                                expl_prompt = (
+                                    "You are EffertyAskMe. The user asked 'why/how'. "
+                                    "Use ONLY the KB facts below to give a brief rationale in the user's language. "
+                                    "Avoid medical promises; 1–5 short sentences; end with: "
+                                    "'Nasihat umum sahaja; dapatkan nasihat doktor jika ragu.'"
+                                )
+                                msgs = [
+                                    {"role":"system","content": expl_prompt},
+                                    {"role":"system","content": f"KB facts:\n{facts}"},
+                                    {"role":"user","content": question}
+                                ]
+                                try:
+                                    chat = client.chat.completions.create(
+                                        model=CHAT_MODEL, messages=msgs, temperature=0.2, max_tokens=160
+                                    )
+                                    extra = _clean_prefixes((chat.choices[0].message.content or "").strip())
+                                except Exception:
+                                    extra = ""
                     if extra:
                         extra = linkify_platforms(extra)
                         suggestions = related_kb_questions(question, cat_key, exclude_q=best["q"], n=3)
@@ -647,6 +620,7 @@ def ask():
         suggestions = related_kb_questions(question, kb_cat or "lain_lain", exclude_q=best["q"] if best else None, n=3)
         return jsonify({"answer": linkify_platforms(answer), "suggestions": suggestions, "used_context": True})
     except Exception as e:
+        # Friendly fallback instead of 500 so UI tak throw "server error"
         print("Server error:", e)
         msg = "Harap maaf. Terjadi ralat pada pelayan. Cuba tanya semula, atau tekan butang 4 untuk hubungi kami."
         return jsonify({"answer": linkify_platforms(msg), "suggestions": [], "used_context": False}), 200
@@ -655,359 +629,55 @@ def ask():
 # App Proxy signature helper
 # =========================
 def _verify_app_proxy_signature(req) -> bool:
+    """
+    Shopify App Proxy HMAC:
+    signature = hex(HMAC_SHA256(secret, path + '?' + sorted_raw_query_without_signature))
+    - GUNA raw query string (jangan URL-decode)
+    - Buang 'signature=' dulu, lepas tu sort ikut key
+    """
     try:
         sig = req.args.get("signature")
         if not sig or not SHOPIFY_SHARED_SECRET:
             return False
-        raw_qs = req.query_string.decode("utf-8", "strict")
-        if not raw_qs: raw_qs = ""
+
+        # 1) Ambil raw query (preserve %2F, %3A, dll)
+        raw_qs = req.query_string.decode("utf-8", "strict")  # contoh: "shop=...&path_prefix=%2Fapps%2Fchatbot&timestamp=...&signature=..."
+        if not raw_qs:
+            raw_qs = ""
+
+        # 2) Buang param 'signature' TANPA decode
         parts = [p for p in raw_qs.split("&") if not p.startswith("signature=") and p != "signature"]
+
+        # 3) Sort ikut key (bahagian sebelum '=')
         parts.sort(key=lambda s: s.split("=", 1)[0])
+
+        # 4) Bina base string exactly macam Shopify expect
         base = req.path + (("?" + "&".join(parts)) if parts else "")
-        digest = hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        # 5) Kira HMAC
+        digest = hmac.new(
+            SHOPIFY_SHARED_SECRET.encode("utf-8"),
+            base.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+
         return hmac.compare_digest(digest, sig)
     except Exception:
         return False
 
-# =========================
-# 2.2 Admin UI (inline)
-# =========================
-@app.route("/admin/ui", methods=["GET"])
-@require_admin
-def admin_ui():
-    html = r"""<!doctype html>
-<html lang="ms">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Efferty Q&A Manager</title>
-<style>
-  :root{
-    --p:#50154A; --ink:#1a1a1a; --bg:#fbf7ff; --card:#ffffff;
-    --line:#ece6f3; --muted:#6e6276; --chip:#f3e8ff; --chip-ink:#3e205a;
-    --shadow:0 8px 28px rgba(0,0,0,.08);
-    --r:16px;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:var(--bg);color:var(--ink)}
-  .admin-header{
-    position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;
-    gap:16px;padding:14px 18px;background:var(--p);color:#fff;
-  }
-  .logo-wrap{display:flex;align-items:center;gap:12px}
-  .admin-logo{width:28px;height:28px;object-fit:contain;filter:drop-shadow(0 1px 0 rgba(0,0,0,.12))}
-  .admin-header h1{margin:0;font-size:18px;font-weight:800;letter-spacing:.2px}
-  .actions{display:flex;align-items:center;gap:10px}
-  .search-bar{display:flex;align-items:center;gap:10px;background:#fff1;padding:6px;border-radius:999px}
-  .search-bar input{border:0;background:transparent;color:#fff;outline:none;min-width:240px}
-  .search-bar input::placeholder{color:#ffffffb3}
-  .actions select{appearance:none;border:0;border-radius:999px;padding:8px 14px;background:#ffffff20;color:#fff;outline:none}
-  .btn{background:var(--p);color:#fff;border:0;border-radius:999px;padding:10px 14px;font-weight:700;cursor:pointer}
-  .btn:hover{opacity:.95}
-  .btn.ghost{background:#fff;color:var(--p);border:1px solid var(--p)}
-  .btn.create{background:#fff;color:var(--p)}
-  .content{max-width:1100px;margin:18px auto;padding:0 16px}
-  .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
-  .cat-card{
-    border:1px solid var(--line);background:var(--card);border-radius:var(--r);
-    padding:18px;text-align:left;box-shadow:var(--shadow);cursor:pointer;transition:.2s transform;
-  }
-  .cat-card:hover{transform:translateY(-2px)}
-  .cat-card .card-title{font-weight:800;font-size:18px;margin-bottom:4px}
-  .cat-card .card-sub{color:var(--muted);font-size:13px}
-  .cat-card.hamil{background:linear-gradient(135deg,#fff,#f7ebff)}
-  .cat-card.sedang{background:linear-gradient(135deg,#fff,#eaf7ff)}
-  .cat-card.lain{background:linear-gradient(135deg,#fff,#eafbef)}
-  .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-  .toolbar-title{font-size:18px;font-weight:800}
-  .badge{display:inline-block;padding:.28rem .6rem;border-radius:999px;background:var(--chip);color:var(--chip-ink);font-size:12px}
-  .table{border:1px solid var(--line);border-radius:var(--r);background:#fff;box-shadow:var(--shadow);overflow:hidden}
-  .thead,.trow{display:grid;grid-template-columns:72px 160px 1fr 1.2fr 132px;gap:0}
-  .thead>div,.trow>div{padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}
-  .thead{background:#f4ecff;font-weight:700}
-  .trow .mono{font-family:ui-monospace,Consolas,Monaco,monospace}
-  .trow .answer{white-space:pre-wrap}
-  .row-actions{display:flex;gap:8px;justify-content:flex-end}
-  .danger{background:#fff;color:#b82a2a;border:1px solid #e2caca}
-  .empty{padding:18px;color:var(--muted)}
-  .pager{display:flex;align-items:center;gap:10px;justify-content:center;padding:12px}
-  .modal{position:fixed;inset:0;background:rgba(20,0,30,.50);display:flex;align-items:center;justify-content:center;padding:16px}
-  .modal-card{width:min(780px,96vw);background:#fff;border-radius:20px;border:1px solid var(--line);box-shadow:var(--shadow);padding:18px;}
-  .modal-card h2{margin:0 0 12px;font-size:18px}
-  .modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:12px}
-  label{font-size:13px;color:#503e58}
-  select,input,textarea{width:100%;border:1px solid #e6dff1;border-radius:12px;padding:10px 12px;font:inherit;background:#fff}
-  textarea{min-height:120px;resize:vertical}
-  @media (max-width:720px){
-    .thead,.trow{grid-template-columns:56px 120px 1fr 1fr 120px}
-    .search-bar input{min-width:140px}
-  }
-</style>
-</head>
-<body>
-  <header class="admin-header">
-    <div class="logo-wrap">
-      <img class="admin-logo" src="/assets/images/logo3.png" alt="Efferty Logo" onerror="this.style.display='none'">
-      <h1>Efferty Q&amp;A Manager</h1>
-    </div>
-    <div class="actions">
-      <select id="hdrCat" aria-label="Pilih kategori">
-        <option value="">Semua kategori</option>
-        <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
-        <option value="sedang_hamil">Sedang Hamil</option>
-        <option value="lain_lain">Lain-Lain</option>
-      </select>
-      <div class="search-bar">
-        <input id="hdrQ" placeholder="Cari soalan / jawapan…" aria-label="Cari soalan atau jawapan">
-      </div>
-      <button class="btn create" id="hdrCreate">+ Q&amp;A</button>
-      <button class="btn" id="hdrSearch">Cari</button>
-    </div>
-  </header>
-
-  <div class="content">
-    <div id="home" class="card-grid" role="list">
-      <button class="cat-card hamil"   data-cat="ikhtiar_hamil" role="listitem">
-        <div class="card-title">Ikhtiar Hamil</div>
-        <div class="card-sub">Q&amp;A untuk TTC, tips umum & panduan ringkas.</div>
-      </button>
-      <button class="cat-card sedang"  data-cat="sedang_hamil" role="listitem">
-        <div class="card-title">Sedang Hamil</div>
-        <div class="card-sub">Soalan lazim semasa kehamilan & pengambilan.</div>
-      </button>
-      <button class="cat-card lain"    data-cat="lain_lain" role="listitem">
-        <div class="card-title">Lain-Lain</div>
-        <div class="card-sub">Info produk am, polisi, platform & lain-lain.</div>
-      </button>
-    </div>
-
-    <main id="catView" class="content" style="display:none;padding:0">
-      <div class="toolbar">
-        <button class="btn ghost" id="backBtn">← Kembali</button>
-        <div class="toolbar-title"><span id="catTitle"></span> <span class="badge" id="totalLbl">0 item</span></div>
-      </div>
-
-      <div class="table">
-        <div class="thead">
-          <div>ID</div><div>Kategori</div><div>Soalan</div><div>Jawapan</div><div></div>
-        </div>
-        <div id="rows"></div>
-        <div class="pager">
-          <button class="btn ghost" id="prevBtn">Sebelum</button>
-          <span id="pageLbl">1</span>
-          <button class="btn ghost" id="nextBtn">Seterusnya</button>
-        </div>
-      </div>
-    </main>
-  </div>
-
-  <div id="modal" class="modal" style="display:none" role="dialog" aria-modal="true">
-    <div class="modal-card">
-      <h2 id="modalTitle">Tambah Q&amp;A</h2>
-      <div style="display:grid;grid-template-columns:1fr;gap:10px">
-        <label for="mcat">Kategori</label>
-        <select id="mcat">
-          <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
-          <option value="sedang_hamil">Sedang Hamil</option>
-          <option value="lain_lain">Lain-Lain</option>
-        </select>
-
-        <label for="mq">Soalan</label>
-        <textarea id="mq" rows="3" placeholder="Tulis soalan…"></textarea>
-
-        <label for="ma">Jawapan</label>
-        <textarea id="ma" rows="10" placeholder="Jawapan penuh (boleh 1., 2., … & baris baharu)"></textarea>
-      </div>
-      <div class="modal-actions">
-        <button class="btn" id="saveBtn">Simpan</button>
-        <button class="btn ghost" id="closeBtn">Tutup</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-(function(){
-  const adminKey = new URLSearchParams(location.search).get('key') || '';
-  if(!adminKey){
-    document.body.innerHTML = '<div class="content"><h2>Unauthorized</h2><p>Tambah <code>?key=…</code> pada URL.</p></div>';
-    return;
-  }
-  const API = (p)=>`/apps/chatbot/admin-api/${p}${p.includes('?')?'&':'?'}key=${encodeURIComponent(adminKey)}`;
-
-  // State
-  let selectedCategory = '';
-  let items=[], total=0, page=1, limit=10;
-  let editingId = null;
-
-  // Helpers
-  const $ = (s)=>document.querySelector(s);
-  const rows = $('#rows'), home = $('#home'), catView = $('#catView');
-  const labelCat = (c)=> c==='ikhtiar_hamil'?'Ikhtiar Hamil':(c==='sedang_hamil'?'Sedang Hamil':(c==='lain_lain'?'Lain-Lain':c));
-  const escapeHtml = (s)=>(''+s).replace(/[&<>\"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
-  const truncate = (s,n)=>!s?'':(s.length>n? s.slice(0,n)+'…' : s);
-
-  function showHome(){
-    home.style.display='grid'; catView.style.display='none';
-    selectedCategory=''; page=1; items=[]; total=0;
-    $('#hdrCat').value=''; $('#catTitle').textContent=''; $('#totalLbl').textContent='0 item';
-    rows.innerHTML=''; $('#pageLbl').textContent='1';
-  }
-
-  function enterCategory(cat){
-    selectedCategory = cat; page=1;
-    home.style.display='none'; catView.style.display='block';
-    $('#catTitle').textContent = labelCat(cat);
-    $('#hdrCat').value = cat;
-    loadItems();
-  }
-
-  function renderRows(){
-    rows.innerHTML = '';
-    if(!items.length){
-      rows.innerHTML = '<div class="empty">Tiada rekod.</div>';
-      return;
-    }
-    items.forEach(item=>{
-      const row = document.createElement('div');
-      row.className = 'trow';
-      row.innerHTML = `
-        <div>${item.id}</div>
-        <div><span class="badge">${labelCat(item.category)}</span></div>
-        <div class="mono">${escapeHtml(item.question)}</div>
-        <div class="mono answer">${escapeHtml(truncate(item.answer, 220))}</div>
-        <div class="row-actions">
-          <button class="btn ghost" data-act="edit" data-id="${item.id}">Edit</button>
-          <button class="btn danger" data-act="del" data-id="${item.id}">Delete</button>
-        </div>`;
-      rows.appendChild(row);
-    });
-    $('#totalLbl').textContent = (total||0)+' item';
-    $('#pageLbl').textContent = String(page);
-  }
-
-  async function loadItems(){
-    if(!selectedCategory) return;
-    const fq = ($('#hdrQ').value||'').trim();
-    const qs = new URLSearchParams({ category:selectedCategory, q:fq, page:String(page), limit:String(limit) });
-    const res = await fetch(API('qa?'+qs.toString()));
-    const data = await res.json();
-    items = data.items||[]; total = data.total||0;
-    renderRows();
-  }
-
-  async function createOrUpdate(){
-    const payload = {
-      category: $('#mcat').value,
-      question: ($('#mq').value||'').trim(),
-      answer:   ($('#ma').value||'').trim(),
-    };
-    if(!payload.category || !payload.question || !payload.answer){
-      alert('Lengkapkan semua medan.'); return;
-    }
-    let url = 'qa', method = 'POST';
-    if(editingId){ url = `qa/${editingId}`; method = 'PUT'; }
-    const res = await fetch(API(url), { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    const data = await res.json();
-    if(data.error){ alert('Operasi gagal.'); return; }
-    closeModal(); await loadItems();
-  }
-
-  async function removeById(id){
-    if(!confirm('Padam rekod #'+id+'?')) return;
-    const res = await fetch(API('qa/'+id), { method:'DELETE' });
-    const data = await res.json();
-    if(!(data&&data.ok)){ alert('Gagal padam.'); return; }
-    await loadItems();
-  }
-
-  function openCreate(){
-    editingId = null;
-    $('#modalTitle').textContent='Tambah Q&A';
-    $('#mcat').value = selectedCategory || 'ikhtiar_hamil';
-    $('#mq').value=''; $('#ma').value='';
-    $('#modal').style.display='flex';
-  }
-  function openEdit(item){
-    editingId = item.id;
-    $('#modalTitle').textContent='Kemaskini Q&A';
-    $('#mcat').value=item.category; $('#mq').value=item.question; $('#ma').value=item.answer;
-    $('#modal').style.display='flex';
-  }
-  function closeModal(){ $('#modal').style.display='none'; }
-
-  document.addEventListener('click',(e)=>{
-    const btn=e.target.closest('[data-cat]'); if(btn) enterCategory(btn.getAttribute('data-cat'));
-    const act=e.target.closest('[data-act]'); if(act){
-      const id=Number(act.getAttribute('data-id'));
-      const item = items.find(x=>x.id===id);
-      if(act.getAttribute('data-act')==='edit') openEdit(item);
-      if(act.getAttribute('data-act')==='del') removeById(id);
-    }
-  });
-  $('#backBtn').onclick = showHome;
-  $('#prevBtn').onclick = ()=>{ if(page>1){ page--; loadItems(); } };
-  $('#nextBtn').onclick = ()=>{ if(page*limit<total){ page++; loadItems(); } };
-  $('#hdrCreate').onclick = ()=> selectedCategory ? openCreate() : alert('Pilih kategori dahulu (klik kad).');
-  $('#hdrSearch').onclick = ()=> selectedCategory ? (page=1, loadItems()) : alert('Pilih kategori dahulu (klik kad).');
-  $('#hdrCat').onchange = (e)=>{ const c=e.target.value; if(c){ enterCategory(c); } };
-  $('#saveBtn').onclick = createOrUpdate;
-  $('#closeBtn').onclick = closeModal;
-
-  showHome();
-})();
-</script>
-</body>
-</html>"""
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # =========================
-# 2.3 Shopify App Proxy (+ alias)
+# Shopify App Proxy (+ alias)
 # =========================
 @app.route("/proxy", methods=["GET","POST"])
 @app.route("/proxy/", methods=["GET","POST"])
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
 def proxy(_extra=None):
     try:
-        # HMAC verify (optional while debug)
         if not DISABLE_HMAC and VERIFY_PROXY and SHOPIFY_SHARED_SECRET:
             if not _verify_app_proxy_signature(request):
                 return jsonify({"error": "bad_signature"}), 200
 
-        # --- Admin paths via proxy (/apps/chatbot/admin, /apps/chatbot/admin-api/...) ---
-        path = (_extra or "").strip().lstrip("/")
-        if path == "admin" and request.method == "GET":
-            return admin_ui()
-
-        if path.startswith("admin-api"):
-            # Map /apps/chatbot/admin-api/...  -> internal /admin/...
-            rest = path[len("admin-api/"):] if path != "admin-api" else ""
-            forward_path = "/admin/" + rest  # e.g. /admin/qa, /admin/qa/12, /admin/categories
-            fmethod = request.method
-            fjson = request.get_json(silent=True) if request.is_json else None
-            fdata = None if fjson is not None else (request.form if request.form else None)
-
-            # Keep the same query string (contains ?key=admin_sk_xxx)
-            with app.test_request_context(
-                forward_path, method=fmethod, json=fjson, data=fdata, query_string=request.query_string
-            ):
-                # dispatch to real handlers with @require_admin
-                if forward_path == "/admin/categories" and fmethod == "GET":
-                    return list_categories()
-                if forward_path == "/admin/qa":
-                    if fmethod == "GET":
-                        return admin_list_qa()
-                    if fmethod == "POST":
-                        return admin_create_qa()
-                m = re.match(r"^/admin/qa/(\d+)$", forward_path)
-                if m:
-                    item_id = int(m.group(1))
-                    if fmethod == "DELETE":
-                        return admin_delete_qa(item_id)
-                    if fmethod == "PUT":
-                        return admin_update_qa(item_id)
-                return jsonify({"error":"bad admin-api route"}), 404
-
-        # --- Normal chatbot flow via proxy ---
         msg, cat_raw = _get_msg_and_cat(request)
 
         if request.method == "GET" and request.args.get("selftest") == "1":
@@ -1031,9 +701,7 @@ def proxy(_extra=None):
 def proxy_alias(_rest=None):
     return proxy(_rest)
 
-# =========================
-# Healthcheck
-# =========================
+# Simple healthcheck & ping
 @app.get("/")
 def health():
     return jsonify({"ok": True, "service": "efferty-chatbot-backend", "version": 1})
@@ -1043,15 +711,13 @@ def ping():
     return jsonify({"ok": True})
 
 # =========================
-# Admin API (protected)
+# Admin API
 # =========================
 @app.route("/admin/categories", methods=["GET"])
-@require_admin
 def list_categories():
     return jsonify({"categories": CATEGORIES})
 
 @app.route("/admin/qa", methods=["GET"])
-@require_admin
 def admin_list_qa():
     try:
         category = request.args.get("category")
@@ -1085,7 +751,6 @@ def admin_list_qa():
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa", methods=["POST"])
-@require_admin
 def admin_create_qa():
     try:
         data = request.get_json(force=True)
@@ -1112,7 +777,6 @@ def admin_create_qa():
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa/<int:item_id>", methods=["PUT"])
-@require_admin
 def admin_update_qa(item_id):
     try:
         data = request.get_json(force=True)
@@ -1149,7 +813,6 @@ def admin_update_qa(item_id):
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa/<int:item_id>", methods=["DELETE"])
-@require_admin
 def admin_delete_qa(item_id):
     try:
         conn = _connect(); c = conn.cursor()
@@ -1171,3 +834,5 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
