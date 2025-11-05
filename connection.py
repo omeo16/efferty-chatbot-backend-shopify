@@ -30,7 +30,6 @@ def _truthy(name, default="false"):
 
 # ---- Robust DB selection ----
 def _pick_db_path():
-    # priority: explicit env → kb.db → knowledge_base.db → kb_embeddings.sqlite
     candidates = []
     env_path = (os.getenv("DB_PATH") or "").strip()
     if env_path:
@@ -45,7 +44,6 @@ def _pick_db_path():
     for p in candidates:
         if os.path.exists(p):
             return p
-    # default to kb.db in repo dir (will be created if needed)
     return os.path.join(here, "kb.db")
 
 DB_PATH = _pick_db_path()
@@ -205,6 +203,33 @@ def _get_msg_and_cat(req):
     if not msg: msg = pick(request.args, keys_msg)
     if not cat: cat = pick(request.args, keys_cat)
     return msg, cat
+
+# =========================
+# 2.1 Admin Auth (token)
+# =========================
+def _get_admin_token():
+    return (os.getenv("ADMIN_TOKEN") or "").strip()
+
+def _pick_key_from_req(req):
+    key = req.args.get("key") or req.values.get("key") or ""
+    if key: return key.strip()
+    key = req.headers.get("X-Admin-Key", "")
+    if key: return key.strip()
+    auth = req.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
+
+def require_admin(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = _get_admin_token()
+        incoming = _pick_key_from_req(request)
+        if not token or not incoming or token != incoming:
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 # =========================
 # Retrieval & re-ranking
@@ -620,7 +645,6 @@ def ask():
         suggestions = related_kb_questions(question, kb_cat or "lain_lain", exclude_q=best["q"] if best else None, n=3)
         return jsonify({"answer": linkify_platforms(answer), "suggestions": suggestions, "used_context": True})
     except Exception as e:
-        # Friendly fallback instead of 500 so UI tak throw "server error"
         print("Server error:", e)
         msg = "Harap maaf. Terjadi ralat pada pelayan. Cuba tanya semula, atau tekan butang 4 untuk hubungi kami."
         return jsonify({"answer": linkify_platforms(msg), "suggestions": [], "used_context": False}), 200
@@ -629,42 +653,204 @@ def ask():
 # App Proxy signature helper
 # =========================
 def _verify_app_proxy_signature(req) -> bool:
-    """
-    Shopify App Proxy HMAC:
-    signature = hex(HMAC_SHA256(secret, path + '?' + sorted_raw_query_without_signature))
-    - GUNA raw query string (jangan URL-decode)
-    - Buang 'signature=' dulu, lepas tu sort ikut key
-    """
     try:
         sig = req.args.get("signature")
         if not sig or not SHOPIFY_SHARED_SECRET:
             return False
-
-        # 1) Ambil raw query (preserve %2F, %3A, dll)
-        raw_qs = req.query_string.decode("utf-8", "strict")  # contoh: "shop=...&path_prefix=%2Fapps%2Fchatbot&timestamp=...&signature=..."
-        if not raw_qs:
-            raw_qs = ""
-
-        # 2) Buang param 'signature' TANPA decode
+        raw_qs = req.query_string.decode("utf-8", "strict")
+        if not raw_qs: raw_qs = ""
         parts = [p for p in raw_qs.split("&") if not p.startswith("signature=") and p != "signature"]
-
-        # 3) Sort ikut key (bahagian sebelum '=')
         parts.sort(key=lambda s: s.split("=", 1)[0])
-
-        # 4) Bina base string exactly macam Shopify expect
         base = req.path + (("?" + "&".join(parts)) if parts else "")
-
-        # 5) Kira HMAC
-        digest = hmac.new(
-            SHOPIFY_SHARED_SECRET.encode("utf-8"),
-            base.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
+        digest = hmac.new(SHOPIFY_SHARED_SECRET.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
         return hmac.compare_digest(digest, sig)
     except Exception:
         return False
 
+# =========================
+# 2.2 Admin UI (inline)
+# =========================
+@app.route("/admin/ui", methods=["GET"])
+@require_admin
+def admin_ui():
+    html = """
+<!doctype html>
+<html lang="ms">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Efferty Q&A Manager</title>
+<style>
+  :root{--p:#50154A}
+  *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,Arial,sans-serif;background:#faf6fb;color:#1a1a1a}
+  header{display:flex;align-items:center;gap:12px;padding:14px 16px;background:var(--p);color:#fff;position:sticky;top:0}
+  header h1{font-size:18px;margin:0;font-weight:700}
+  main{padding:16px;max-width:980px;margin:0 auto}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .card{background:#fff;border:1px solid #eee;border-radius:14px;box-shadow:0 6px 18px rgba(0,0,0,.06)}
+  .card.pad{padding:14px}
+  label{font-size:13px;color:#555}
+  input,select,textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font:inherit;background:#fff}
+  textarea{min-height:120px;resize:vertical}
+  button{background:var(--p);color:#fff;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+  button.ghost{background:#fff;color:var(--p);border:1px solid var(--p)}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:10px;border-bottom:1px solid #eee;font-size:14px;vertical-align:top}
+  th{background:#faf0ff;text-align:left}
+  .muted{color:#666;font-size:12px}
+  .row>.col{flex:1 1 320px}
+  .danger{color:#c0392b}
+  .badge{display:inline-block;padding:.25rem .5rem;border-radius:999px;background:#f3e8ff;color:#40205f;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 6a3 3 0 0 1 3-3h8l7 7v11a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6z" stroke="white" stroke-width="1.6"/><path d="M14 3v5a2 2 0 0 0 2 2h5" stroke="white" stroke-width="1.6"/></svg>
+  <h1>Efferty Q&amp;A Manager <span class="badge">Admin</span></h1>
+</header>
+<main>
+  <div class="row">
+    <div class="col">
+      <div class="card pad">
+        <h3 style="margin:0 0 10px">Tambah Soalan</h3>
+        <div class="row">
+          <div class="col">
+            <label>Kategori</label>
+            <select id="cat">
+              <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
+              <option value="sedang_hamil">Sedang Hamil</option>
+              <option value="lain_lain">Lain-Lain</option>
+            </select>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <label>Soalan</label>
+          <input id="q" placeholder="Tulis soalan..." />
+        </div>
+        <div style="margin-top:8px">
+          <label>Jawapan</label>
+          <textarea id="a" placeholder="Tulis jawapan penuh..."></textarea>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:12px">
+          <button id="addBtn">Simpan</button>
+          <button class="ghost" id="refreshBtn">Refresh Senarai</button>
+        </div>
+        <p class="muted" style="margin-top:8px">Selepas simpan, embedding auto-generate.</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card pad">
+        <h3 style="margin:0 0 10px">Cari &amp; Senarai Soalan</h3>
+        <div class="row">
+          <div class="col">
+            <label>Filter kategori</label>
+            <select id="fcat">
+              <option value="">Semua</option>
+              <option value="ikhtiar_hamil">Ikhtiar Hamil</option>
+              <option value="sedang_hamil">Sedang Hamil</option>
+              <option value="lain_lain">Lain-Lain</option>
+            </select>
+          </div>
+          <div class="col">
+            <label>Kata kunci</label>
+            <input id="fq" placeholder="cth: PCOS, minum, waktu" />
+          </div>
+          <div class="col" style="align-self:flex-end">
+            <button id="findBtn">Cari</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card pad" style="margin-top:14px">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h3 style="margin:0">Hasil</h3><span class="muted" id="totalLbl">0 item</span>
+    </div>
+    <div style="overflow:auto;margin-top:10px">
+      <table id="tbl">
+        <thead><tr><th>ID</th><th>Kategori</th><th>Soalan</th><th>Jawapan</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+<script>
+(function(){
+  const adminKey = new URLSearchParams(location.search).get('key') || '';
+  if (!adminKey) {
+    document.body.innerHTML = '<main style="padding:24px"><h2>Unauthorized</h2><p>Tiada ?key= dalam URL.</p></main>';
+    return;
+  }
+  const API = (p) => `/apps/chatbot/admin-api/${p}${p.includes('?')?'&':'?'}key=${encodeURIComponent(adminKey)}`;
+
+  const $ = (s)=>document.querySelector(s);
+  const tblBody = document.querySelector('#tbl tbody');
+  const totalLbl = document.querySelector('#totalLbl');
+
+  async function list(page=1){
+    const fcat = document.querySelector('#fcat').value.trim();
+    const fq   = document.querySelector('#fq').value.trim();
+    const qs = new URLSearchParams({ page:String(page), limit:'50' });
+    if (fcat) qs.set('category', fcat);
+    if (fq)   qs.set('q', fq);
+
+    const res = await fetch(API('qa?'+qs.toString()));
+    if (!res.ok) throw new Error('List fail '+res.status);
+    const data = await res.json();
+    tblBody.innerHTML = '';
+    (data.items||[]).forEach(item=>{
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${item.id}</td>
+        <td><span class="badge">${item.category}</span></td>
+        <td>${escapeHtml(item.question)}</td>
+        <td><div class="muted" style="max-width:420px;white-space:pre-wrap">${escapeHtml(item.answer)}</div></td>
+        <td><button data-id="${item.id}" class="del danger">Delete</button></td>
+      `;
+      tblBody.appendChild(tr);
+    });
+    totalLbl.textContent = (data.total||0) + ' item';
+  }
+
+  function escapeHtml(s){ return (''+s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+
+  async function add(){
+    const cat = document.querySelector('#cat').value.trim();
+    const q   = document.querySelector('#q').value.trim();
+    const a   = document.querySelector('#a').value.trim();
+    if (!cat || !q || !a){ alert('Lengkapkan semua field.'); return; }
+    const res = await fetch(API('qa'), {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ category:cat, question:q, answer:a })
+    });
+    if (!res.ok){ alert('Gagal simpan: '+res.status); return; }
+    await list(1);
+    document.querySelector('#q').value=''; document.querySelector('#a').value='';
+  }
+
+  async function del(id){
+    if (!confirm('Padam item '+id+'?')) return;
+    const res = await fetch(API('qa/'+id), { method:'DELETE' });
+    if (!res.ok){ alert('Gagal padam: '+res.status); return; }
+    await list(1);
+  }
+
+  document.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button.del');
+    if (btn){ del(btn.getAttribute('data-id')); }
+  });
+
+  document.querySelector('#addBtn').addEventListener('click', add);
+  document.querySelector('#refreshBtn').addEventListener('click', ()=>list(1));
+  document.querySelector('#findBtn').addEventListener('click', ()=>list(1));
+  list(1);
+})();
+</script>
+</body>
+</html>
+    """
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # =========================
 # Shopify App Proxy (+ alias)
@@ -674,10 +860,39 @@ def _verify_app_proxy_signature(req) -> bool:
 @app.route("/proxy/<path:_extra>", methods=["GET","POST"])
 def proxy(_extra=None):
     try:
+        # HMAC verify (optional while debug)
         if not DISABLE_HMAC and VERIFY_PROXY and SHOPIFY_SHARED_SECRET:
             if not _verify_app_proxy_signature(request):
                 return jsonify({"error": "bad_signature"}), 200
 
+        # 2.3 — Admin paths via proxy
+        path = (_extra or "").strip().lstrip("/")
+        if path == "admin" and request.method == "GET":
+            return admin_ui()
+        if path.startswith("admin-api"):
+            rest = path[len("admin-api/"):] if path != "admin-api" else ""
+            forward_path = "/admin/" + rest
+            fmethod = request.method
+            fjson = request.get_json(silent=True) if request.is_json else None
+            fdata = None if fjson is not None else (request.form if request.form else None)
+            with app.test_request_context(
+                forward_path, method=fmethod, json=fjson, data=fdata, query_string=request.query_string
+            ):
+                if forward_path.startswith("/admin/qa"):
+                    if fmethod == "GET" and forward_path == "/admin/qa":
+                        return admin_list_qa()
+                    if fmethod == "POST" and forward_path == "/admin/qa":
+                        return admin_create_qa()
+                    m = re.match(r"^/admin/qa/(\d+)$", forward_path)
+                    if m:
+                        item_id = int(m.group(1))
+                        if fmethod == "DELETE":
+                            return admin_delete_qa(item_id)
+                        if fmethod == "PUT":
+                            return admin_update_qa(item_id)
+                return jsonify({"error":"bad admin-api route"}), 404
+
+        # normal chatbot flow
         msg, cat_raw = _get_msg_and_cat(request)
 
         if request.method == "GET" and request.args.get("selftest") == "1":
@@ -711,13 +926,15 @@ def ping():
     return jsonify({"ok": True})
 
 # =========================
-# Admin API
+# Admin API (protected)
 # =========================
 @app.route("/admin/categories", methods=["GET"])
+@require_admin
 def list_categories():
     return jsonify({"categories": CATEGORIES})
 
 @app.route("/admin/qa", methods=["GET"])
+@require_admin
 def admin_list_qa():
     try:
         category = request.args.get("category")
@@ -751,6 +968,7 @@ def admin_list_qa():
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa", methods=["POST"])
+@require_admin
 def admin_create_qa():
     try:
         data = request.get_json(force=True)
@@ -777,6 +995,7 @@ def admin_create_qa():
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa/<int:item_id>", methods=["PUT"])
+@require_admin
 def admin_update_qa(item_id):
     try:
         data = request.get_json(force=True)
@@ -813,6 +1032,7 @@ def admin_update_qa(item_id):
         return jsonify({"error": "Internal Server Error"}), 500
 
 @app.route("/admin/qa/<int:item_id>", methods=["DELETE"])
+@require_admin
 def admin_delete_qa(item_id):
     try:
         conn = _connect(); c = conn.cursor()
@@ -834,4 +1054,3 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-
