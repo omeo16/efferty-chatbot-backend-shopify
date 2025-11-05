@@ -4,7 +4,9 @@ import hmac
 import hashlib
 import sqlite3
 import numpy as np
-from flask import Flask, request, jsonify
+from urllib.parse import quote
+
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
@@ -88,8 +90,29 @@ SMART_DISCLAIMER = os.getenv(
 
 SHOPIFY_SHARED_SECRET = os.getenv("SHOPIFY_SHARED_SECRET", "")
 
+# Store domain utk embed redirect (contoh: effertymama.myshopify.com)
+SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip()
+
 app = Flask(__name__)
 CORS(app)
+
+# =========================
+# Embed headers for Shopify Admin (iframe)
+# =========================
+@app.after_request
+def _set_embed_headers(resp):
+    csp = [
+        "default-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+        "connect-src 'self' https://*.myshopify.com https://admin.shopify.com",
+        "frame-ancestors https://admin.shopify.com https://*.myshopify.com",
+        "frame-src https://*.myshopify.com",
+    ]
+    resp.headers["Content-Security-Policy"] = "; ".join(csp)
+    resp.headers["X-Frame-Options"] = "ALLOWALL"
+    return resp
 
 # =========================
 # Helpers
@@ -539,7 +562,6 @@ def ask():
                     if not extra:
                         any_best, any_cat = retrieve_candidates_any(question, top_n=TOP_N)
                         if any_cat:
-                            # simple back-up explanation
                             extra = _justify_answer(question, answer, any_cat)
                     if extra:
                         extra = linkify_platforms(extra)
@@ -852,17 +874,17 @@ def admin_ui():
   function showHome(){
     home.style.display='grid'; catView.style.display='none';
     selectedCategory=''; page=1; items=[]; total=0;
-    $('#hdrCat').value='';
-    $('#catTitle').textContent='';
-    $('#totalLbl').textContent='0 item';
+    document.querySelector('#hdrCat').value='';
+    document.querySelector('#catTitle').textContent='';
+    document.querySelector('#totalLbl').textContent='0 item';
     rows.innerHTML='';
-    $('#pageLbl').textContent='1';
+    document.querySelector('#pageLbl').textContent='1';
   }
   function enterCategory(cat){
     selectedCategory = cat; page=1;
     home.style.display='none'; catView.style.display='block';
-    $('#catTitle').textContent = labelCat(cat);
-    $('#hdrCat').value = cat;
+    document.querySelector('#catTitle').textContent = labelCat(cat);
+    document.querySelector('#hdrCat').value = cat;
     loadItems();
   }
   function renderRows(){
@@ -885,14 +907,14 @@ def admin_ui():
         </div>`;
       rows.appendChild(row);
     });
-    $('#totalLbl').textContent = (total||0)+' item';
-    $('#pageLbl').textContent = String(page);
+    document.querySelector('#totalLbl').textContent = (total||0)+' item';
+    document.querySelector('#pageLbl').textContent = String(page);
   }
 
   /* ===== Data ops ===== */
   async function loadItems(){
     if(!selectedCategory) return;
-    const fq = ($('#hdrQ').value||'').trim();
+    const fq = (document.querySelector('#hdrQ').value||'').trim();
     const qs = new URLSearchParams({ category:selectedCategory, q:fq, page:String(page), limit:String(limit) });
     const res = await fetch(API('qa?'+qs.toString()));
     const data = await res.json();
@@ -901,9 +923,9 @@ def admin_ui():
   }
   async function createOrUpdate(){
     const payload = {
-      category: $('#mcat').value,
-      question: ($('#mq').value||'').trim(),
-      answer:   ($('#ma').value||'').trim(),
+      category: document.querySelector('#mcat').value,
+      question: (document.querySelector('#mq').value||'').trim(),
+      answer:   (document.querySelector('#ma').value||'').trim(),
     };
     if(!payload.category || !payload.question || !payload.answer){ alert('Lengkapkan semua medan.'); return; }
     let url = 'qa', method = 'POST';
@@ -924,39 +946,39 @@ def admin_ui():
   /* ===== Modal ===== */
   function openCreate(){
     editingId = null;
-    $('#modalTitle').textContent='Tambah Q&A';
-    $('#mcat').value = selectedCategory || 'ikhtiar_hamil';
-    $('#mq').value=''; $('#ma').value='';
-    $('#modal').style.display='flex';
+    document.querySelector('#modalTitle').textContent='Tambah Q&A';
+    document.querySelector('#mcat').value = selectedCategory || 'ikhtiar_hamil';
+    document.querySelector('#mq').value=''; document.querySelector('#ma').value='';
+    document.querySelector('#modal').style.display='flex';
   }
   function openEdit(item){
     editingId = item.id;
-    $('#modalTitle').textContent='Kemaskini Q&A';
-    $('#mcat').value=item.category; $('#mq').value=item.question; $('#ma').value=item.answer;
-    $('#modal').style.display='flex';
+    document.querySelector('#modalTitle').textContent='Kemaskini Q&A';
+    document.querySelector('#mcat').value=item.category; document.querySelector('#mq').value=item.question; document.querySelector('#ma').value=item.answer;
+    document.querySelector('#modal').style.display='flex';
   }
-  function closeModal(){ $('#modal').style.display='none'; }
+  function closeModal(){ document.querySelector('#modal').style.display='none'; }
 
   /* ===== Events ===== */
-  document.addEventListener('click',(e)=>{
-    const btn=e.target.closest('[data-cat]'); if(btn) enterCategory(btn.getAttribute('data-cat'));
-    const act=e.target.closest('[data-act]'); if(act){
-      const id=Number(act.getAttribute('data-id'));
+  document.addEventListener('click', (e)=>{
+    const btn = e.target.closest('[data-cat]'); if(btn) enterCategory(btn.getAttribute('data-cat'));
+    const act = e.target.closest('[data-act]'); if(act){
+      const id = Number(act.getAttribute('data-id'));
       const item = items.find(x=>x.id===id);
       if(act.getAttribute('data-act')==='edit') openEdit(item);
       if(act.getAttribute('data-act')==='del') removeById(id);
     }
   });
-  $('#backBtn').onclick = showHome;
-  $('#prevBtn').onclick = ()=>{ if(page>1){ page--; loadItems(); } };
-  $('#nextBtn').onclick = ()=>{ if(page*limit<total){ page++; loadItems(); } };
+  document.querySelector('#backBtn').onclick = showHome;
+  document.querySelector('#prevBtn').onclick = ()=>{ if(page>1){ page--; loadItems(); } };
+  document.querySelector('#nextBtn').onclick = ()=>{ if(page*limit<total){ page++; loadItems(); } };
 
-  $('#hdrCreate').onclick = ()=> selectedCategory ? openCreate() : alert('Pilih kategori dahulu (klik kad).');
-  $('#hdrSearch').onclick = ()=> selectedCategory ? (page=1, loadItems()) : alert('Pilih kategori dahulu (klik kad).');
-  $('#hdrCat').onchange = (e)=>{ const c=e.target.value; if(c){ enterCategory(c); } };
+  document.querySelector('#hdrCreate').onclick = ()=> selectedCategory ? openCreate() : alert('Pilih kategori dahulu (klik kad).');
+  document.querySelector('#hdrSearch').onclick = ()=> selectedCategory ? (page=1, loadItems()) : alert('Pilih kategori dahulu (klik kad).');
+  document.querySelector('#hdrCat').onchange = (e)=>{ const c=e.target.value; if(c){ enterCategory(c); } };
 
-  $('#saveBtn').onclick = createOrUpdate;
-  $('#closeBtn').onclick = closeModal;
+  document.querySelector('#saveBtn').onclick = createOrUpdate;
+  document.querySelector('#closeBtn').onclick = closeModal;
 
   // first render
   showHome();
@@ -965,7 +987,6 @@ def admin_ui():
 </body>
 </html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
 
 # =========================
 # 2.3 Shopify App Proxy (+ alias)
@@ -1037,6 +1058,26 @@ def proxy(_extra=None):
 @app.route("/apps/chatbot/<path:_rest>", methods=["GET","POST"])
 def proxy_alias(_rest=None):
     return proxy(_rest)
+
+# =========================
+# Shopify Admin entry (embedded, no Remix)
+# =========================
+@app.route("/shopify/admin", methods=["GET"])
+def shopify_admin_entry():
+    """
+    Entry point dari Shopify Admin → redirect ke App Proxy Admin UI:
+    https://<store>.myshopify.com/apps/chatbot/admin?key=<ADMIN_TOKEN>
+    """
+    store = (request.args.get("shop") or SHOPIFY_STORE_DOMAIN).strip()
+    if not store:
+        return jsonify({"error": "missing_store", "hint": "Set SHOPIFY_STORE_DOMAIN or pass ?shop=<store>.myshopify.com"}), 400
+
+    admin_token = _get_admin_token()
+    if not admin_token:
+        return jsonify({"error": "missing_ADMIN_TOKEN"}), 500
+
+    url = f"https://{store}/apps/chatbot/admin?key={quote(admin_token)}"
+    return redirect(url, code=302)
 
 # =========================
 # Healthcheck
@@ -1178,4 +1219,3 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-
