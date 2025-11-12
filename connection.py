@@ -1,3 +1,5 @@
+# connection.py — SQLite (dev) ↔ PostgreSQL (prod) ready
+# ------------------------------------------------------
 import os
 import re
 import hmac
@@ -10,6 +12,17 @@ from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
 from langdetect import detect
 from deep_translator import GoogleTranslator
+
+# ============== NEW: optional Postgres (psycopg) ==========
+_IS_PG = False
+_PG = None
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    _PG = psycopg
+except Exception:
+    _PG = None
+# ==========================================================
 
 # =========================
 # Config
@@ -48,8 +61,16 @@ def _pick_db_path():
     # default to kb.db in repo dir (will be created if needed)
     return os.path.join(here, "kb.db")
 
+DB_URL = (os.getenv("DATABASE_URL") or "").strip()
 DB_PATH = _pick_db_path()
-print(">>> DEBUG: DB_PATH =", DB_PATH, "| exists?", os.path.exists(DB_PATH))
+
+if DB_URL and DB_URL.startswith("postgresql") and _PG is not None:
+    _IS_PG = True
+
+print(">>> DEBUG DB:",
+      "MODE=PostgreSQL" if _IS_PG else "MODE=SQLite",
+      "| DB_URL set?" , bool(DB_URL),
+      "| DB_PATH=", DB_PATH, "| exists?", os.path.exists(DB_PATH))
 
 TOP_N = 8
 COS_MIN, KW_MIN = 0.20, 0.12
@@ -113,10 +134,52 @@ def linkify_platforms(text: str) -> str:
         html = regex.sub(lambda m: f'<a href="{url}" target="_blank" rel="noopener">{m.group(1)}</a>', html)
     return html
 
+# ---------- NEW: PG compat cursor (translate ? → %s) ----------
+class _PgCursor:
+    def __init__(self, cur):
+        self._cur = cur
+        self.lastrowid = None
+    def execute(self, sql, params=None):
+        sql2 = sql.replace("?", "%s")
+        self._cur.execute(sql2, params or [])
+        # handle lastrowid for INSERT ... RETURNING id
+        up = sql.strip().upper()
+        if up.startswith("INSERT ") and " RETURNING " not in up:
+            # Try to fetch id if table has id col
+            try:
+                self._cur.execute("SELECT LASTVAL()")
+                self.lastrowid = self._cur.fetchone()[0]
+            except Exception:
+                self.lastrowid = None
+        return self
+    def executemany(self, sql, seq):
+        sql2 = sql.replace("?", "%s")
+        self._cur.executemany(sql2, seq or [])
+        return self
+    def fetchone(self):
+        return self._cur.fetchone()
+    def fetchall(self):
+        return self._cur.fetchall()
+
+class _PgConn:
+    def __init__(self, conn):
+        self._conn = conn
+    def cursor(self):
+        return _PgCursor(self._conn.cursor(row_factory=dict_row))
+    def commit(self):
+        self._conn.commit()
+    def close(self):
+        self._conn.close()
+
 def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Return SQLite conn (sqlite3.Row) or Postgres conn (dict rows, ? → %s)."""
+    if not _IS_PG:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    # Postgres
+    conn = _PG.connect(DB_URL)  # sslmode di URL
+    return _PgConn(conn)
 
 def _norm_cat_key(s: str) -> str:
     return (s or "").strip().lower().replace(" ", "_")
@@ -218,7 +281,7 @@ def _load_qa_rows(category: str):
             WHERE lower(replace(trim(category), ' ', '_')) = ?
         """, (_norm_cat_key(category),))
         rows = c.fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         rows = []
     finally:
         conn.close()
@@ -274,7 +337,7 @@ def related_kb_questions(question: str, category: str, exclude_q: str = None, n:
             WHERE lower(replace(trim(category), ' ', '_')) = ?
         """, (_norm_cat_key(category),))
         rows = c.fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         rows = []
     finally:
         conn.close()
@@ -395,16 +458,28 @@ def _sync_category_txt(category: str):
 def _ensure_generated_table():
     try:
         conn = _connect(); c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS generated_answers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT,
-                user_question TEXT,
-                ai_answer TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                approved INTEGER DEFAULT 0
-            )
-        """)
+        if _IS_PG:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS generated_answers (
+                    id SERIAL PRIMARY KEY,
+                    category TEXT,
+                    user_question TEXT,
+                    ai_answer TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    approved INTEGER DEFAULT 0
+                )
+            """)
+        else:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS generated_answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT,
+                    user_question TEXT,
+                    ai_answer TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    approved INTEGER DEFAULT 0
+                )
+            """)
         conn.commit(); conn.close()
     except Exception as e:
         print("generated_answers init error:", e)
@@ -412,14 +487,25 @@ def _ensure_generated_table():
 def _ensure_kb_table():
     try:
         conn = _connect(); c = conn.cursor()
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS knowledge_base_qa (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            question TEXT,
-            answer   TEXT,
-            q_embedding BLOB
-        )""")
+        if _IS_PG:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_base_qa (
+                    id SERIAL PRIMARY KEY,
+                    category TEXT,
+                    question TEXT,
+                    answer   TEXT,
+                    q_embedding BYTEA
+                )
+            """)
+        else:
+            c.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_base_qa (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT,
+                question TEXT,
+                answer   TEXT,
+                q_embedding BLOB
+            )""")
         conn.commit(); conn.close()
     except Exception as e:
         print("kb table init error:", e)
@@ -613,7 +699,11 @@ def ask():
                 "INSERT INTO generated_answers (category, user_question, ai_answer) VALUES (?, ?, ?)",
                 (kb_cat or "lain_lain", question, answer)
             )
-            conn.commit(); conn.close()
+            if not _IS_PG:
+                conn.commit()
+            else:
+                conn.commit()
+            conn.close()
         except Exception:
             pass
 
@@ -640,21 +730,14 @@ def _verify_app_proxy_signature(req) -> bool:
         if not sig or not SHOPIFY_SHARED_SECRET:
             return False
 
-        # 1) Ambil raw query (preserve %2F, %3A, dll)
-        raw_qs = req.query_string.decode("utf-8", "strict")  # contoh: "shop=...&path_prefix=%2Fapps%2Fchatbot&timestamp=...&signature=..."
+        raw_qs = req.query_string.decode("utf-8", "strict")
         if not raw_qs:
             raw_qs = ""
 
-        # 2) Buang param 'signature' TANPA decode
         parts = [p for p in raw_qs.split("&") if not p.startswith("signature=") and p != "signature"]
-
-        # 3) Sort ikut key (bahagian sebelum '=')
         parts.sort(key=lambda s: s.split("=", 1)[0])
-
-        # 4) Bina base string exactly macam Shopify expect
         base = req.path + (("?" + "&".join(parts)) if parts else "")
 
-        # 5) Kira HMAC
         digest = hmac.new(
             SHOPIFY_SHARED_SECRET.encode("utf-8"),
             base.encode("utf-8"),
@@ -736,7 +819,8 @@ def admin_list_qa():
             like = f"%{query}%"; params.extend([like, like])
 
         c.execute(f"SELECT COUNT(*) {base_sql}", params)
-        total = c.fetchone()[0]
+        total = c.fetchone()
+        total = total["count"] if isinstance(total, dict) and "count" in total else (total[0] if total else 0)
 
         c.execute(
             f"SELECT id, category, question, answer {base_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -744,7 +828,10 @@ def admin_list_qa():
         )
         rows = c.fetchall(); conn.close()
 
-        items = [dict(id=r["id"], category=r["category"], question=r["question"], answer=r["answer"]) for r in rows]
+        def _row_to_dict(r):
+            if isinstance(r, dict): return r
+            return dict(id=r["id"], category=r["category"], question=r["question"], answer=r["answer"])
+        items = [_row_to_dict(r) for r in rows]
         return jsonify({"items": items, "total": total, "page": page, "limit": limit})
     except Exception as e:
         print("Admin list error:", e)
@@ -764,11 +851,20 @@ def admin_create_qa():
 
         emb = _embed(question).tobytes()
         conn = _connect(); c = conn.cursor()
-        c.execute(
-            "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (?, ?, ?, ?)",
-            (category, question, answer, emb)
-        )
-        new_id = c.lastrowid; conn.commit(); conn.close()
+        if _IS_PG:
+            c.execute(
+                "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (?, ?, ?, ?) RETURNING id",
+                (category, question, answer, emb)
+            )
+            new_id_row = c.fetchone()
+            new_id = new_id_row["id"] if isinstance(new_id_row, dict) else (new_id_row[0] if new_id_row else None)
+            conn.commit(); conn.close()
+        else:
+            c.execute(
+                "INSERT INTO knowledge_base_qa (category, question, answer, q_embedding) VALUES (?, ?, ?, ?)",
+                (category, question, answer, emb)
+            )
+            new_id = c.lastrowid; conn.commit(); conn.close()
 
         _sync_category_txt(category)
         return jsonify({"id": new_id, "category": category, "question": question, "answer": answer})
@@ -790,7 +886,7 @@ def admin_update_qa(item_id):
         if not row:
             conn.close(); return jsonify({"error": "Not found"}), 404
 
-        old_cat = row["category"]
+        old_cat = row["category"] if isinstance(row, dict) else row["category"]
         new_cat = category if category else row["category"]
         new_q   = question.strip() if isinstance(question, str) else row["question"]
         new_a   = answer.strip() if isinstance(answer, str) else row["answer"]
@@ -820,7 +916,7 @@ def admin_delete_qa(item_id):
         r = c.fetchone()
         if not r:
             conn.close(); return jsonify({"error": "Not found"}), 404
-        cat = r["category"]
+        cat = r["category"] if isinstance(r, dict) else r["category"]
 
         c.execute("DELETE FROM knowledge_base_qa WHERE id=?", (item_id,))
         conn.commit(); conn.close()
@@ -834,5 +930,3 @@ def admin_delete_qa(item_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-
-
