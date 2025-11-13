@@ -8,3 +8,4 @@ langdetect==1.0.9
 deep-translator==1.11.4
 numpy==1.26.4
 gunicorn==21.2.0
+psycopg[binary]
